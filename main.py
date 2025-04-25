@@ -110,7 +110,7 @@ except ImportError:
 
 # Neo4j Database Manager class - moved here to be available globally
 class Neo4jDatabaseManager:
-    def __init__(self, uri="bolt://localhost:7687", username="neo4j", password="neo4j", database="neo4j"):
+    def __init__(self, uri="bolt://localhost:7687", username="neo4j", password="neo4j", database="neo4j", show_ui=True):
         self.uri = uri
         self.username = username
         self.password = password
@@ -118,30 +118,67 @@ class Neo4jDatabaseManager:
         self.driver = None
         self.vector_store = None
         self.connected = False
+        self.show_ui = show_ui  # Control UI visibility
         self.connect()
 
     def connect(self):
         """Connect to Neo4j database"""
-        try:
-            if not NEO4J_AVAILABLE:
-                log_message("Neo4j functionality is not available", True)
-                return False
-                
-            self.driver = GraphDatabase.driver(
-                self.uri, 
-                auth=(self.username, self.password)
-            )
-            
-            # Test connection
-            self.driver.verify_connectivity()
-            self.connected = True
-            log_message(f"Connected to Neo4j database at {self.uri}")
-            return True
-        except Exception as e:
-            log_message(f"Error connecting to Neo4j database: {str(e)}", True)
-            self.connected = False
+        if not NEO4J_AVAILABLE:
+            log_message("Neo4j functionality is not available", True)
             return False
             
+        # Use a retry mechanism for connection
+        max_retries = 5
+        retry_delay = 2
+        
+        for attempt in range(max_retries):
+            try:
+                log_message(f"Connecting to Neo4j (attempt {attempt+1}/{max_retries})...")
+                
+                # Make sure we properly import Neo4j trust settings
+                from neo4j import GraphDatabase, TrustAll, TRUST_ALL_CERTIFICATES
+                
+                # Create connection with more reliable settings for macOS
+                self.driver = GraphDatabase.driver(
+                    self.uri, 
+                    auth=(self.username, self.password),
+                    trusted_certificates=TrustAll(),  # Use proper TrustAll object
+                    connection_timeout=15,           # Longer connection timeout
+                    max_connection_lifetime=3600,    # Keep connections alive for 1 hour
+                    keep_alive=True                  # Use TCP keepalive
+                )
+                
+                # Test connection with retry
+                for i in range(3):
+                    try:
+                        self.driver.verify_connectivity()
+                        self.connected = True
+                        log_message(f"Connected to Neo4j database at {self.uri}")
+                        return True
+                    except Exception as e:
+                        if i < 2:  # Only log intermediate errors if we have more retries
+                            log_message(f"Connectivity test attempt {i+1} failed: {str(e)}")
+                            time.sleep(1)
+                        else:
+                            raise  # Re-raise the exception on the last attempt
+                
+            except Exception as e:
+                log_message(f"Connection attempt {attempt+1} failed: {str(e)}", True)
+                if self.driver:
+                    try:
+                        self.driver.close()
+                    except:
+                        pass
+                    self.driver = None
+                
+                # If we still have retries left, wait and try again
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                else:
+                    log_message("All connection attempts to Neo4j failed", True)
+                    self.connected = False
+                    return False
+    
     def close(self):
         """Close the Neo4j connection"""
         if self.driver:
@@ -344,69 +381,58 @@ class Neo4jDatabaseManager:
             return False
 
     def add_document(self, document_id, title, content, metadata=None):
-        """Add a document to the database"""
+        """Add a document to Neo4j graph"""
         try:
             if not self.connected:
-                log_message("Neo4j connection not available", True)
+                log_message("Not connected to Neo4j", True)
                 return False
-                
-            if not LANGCHAIN_AVAILABLE or not self.vector_store:
-                log_message("LangChain or vector store not available", True)
-                return False
-                
-            # Process metadata
-            if metadata is None:
-                metadata = {}
-                
-            # Add document title to metadata
-            metadata["title"] = title
-            metadata["document_id"] = document_id
-                
-            # Check if document already exists
+            
+            # Create safe metadata - ensure it contains only primitive types
+            safe_metadata = {}
+            if metadata:
+                for k, v in metadata.items():
+                    # Skip nested objects and complex types
+                    if isinstance(v, (str, int, float, bool)) or (isinstance(v, list) and all(isinstance(i, (str, int, float, bool)) for i in v)):
+                        safe_metadata[k] = v
+                    else:
+                        # Convert complex objects to string representation
+                        safe_metadata[k] = str(v)
+            
             with self.driver.session() as session:
-                result = session.run(
-                    "MATCH (d:Document {document_id: $id}) RETURN count(d) AS count",
-                    id=document_id
-                )
-                doc_exists = result.single()["count"] > 0
+                # Create the document node
+                session.run("""
+                MERGE (d:Document {document_id: $doc_id})
+                SET d.title = $title,
+                    d.content = $content,
+                    d.updated_at = datetime()
+                """, doc_id=document_id, title=title, content=content)
                 
-            if doc_exists:
-                log_message(f"Document {document_id} already exists in database")
-                
-                # Remove existing document
-                with self.driver.session() as session:
-                    # Delete document node and relationships
-                    session.run(
-                        """
-                        MATCH (d:Document {document_id: $id})
-                        DETACH DELETE d
-                        """,
-                        id=document_id
-                    )
+                # Add metadata as separate properties, not as a nested object
+                if safe_metadata:
+                    # Create a Cypher query dynamically based on metadata keys
+                    metadata_sets = []
+                    params = {"doc_id": document_id}
                     
-                log_message(f"Existing document {document_id} removed for replacement")
+                    for i, (key, value) in enumerate(safe_metadata.items()):
+                        param_key = f"meta_{i}"
+                        metadata_sets.append(f"d.meta_{key} = ${param_key}")
+                        params[param_key] = value
+                    
+                    # Combine all the SET statements
+                    metadata_query = f"""
+                    MATCH (d:Document {{document_id: $doc_id}})
+                    SET {', '.join(metadata_sets)}
+                    """
+                    
+                    # Execute the query
+                    session.run(metadata_query, **params)
                 
-            # Process document with text splitter
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000, 
-                chunk_overlap=200
-            )
-            
-            # Split document into chunks
-            docs = text_splitter.create_documents(
-                texts=[content],
-                metadatas=[metadata]
-            )
-            
-            # Add to vector store
-            self.vector_store.add_documents(docs)
-            
-            log_message(f"Document {document_id} added to database with {len(docs)} chunks")
-            return True
+                log_message(f"Added document {document_id} to database")
+                return True
         except Exception as e:
             log_message(f"Error adding document to database: {str(e)}", True)
             return False
-            
+    
     def remove_document(self, document_id):
         """Remove a document from the database"""
         try:
@@ -689,26 +715,29 @@ class EmbeddedNeo4jServer:
                 # Enable APOC
                 elif line.strip().startswith('#dbms.security.procedures.unrestricted='):
                     line = "dbms.security.procedures.unrestricted=apoc.*\n"
-                # Disable authentication for local use
+                # Disable authentication - important for local use
                 elif line.strip().startswith('#dbms.security.auth_enabled='):
                     line = "dbms.security.auth_enabled=false\n"
-                # Set default listen address to accept connections
+                # Set default listen address specifically to localhost to avoid network interface issues
                 elif line.strip().startswith('#dbms.default_listen_address='):
-                    line = "dbms.default_listen_address=0.0.0.0\n"
-                # Configure the Bolt connector to explicitly listen on localhost
+                    line = "dbms.default_listen_address=localhost\n"
+                # Configure the Bolt connector explicitly
                 elif line.strip().startswith('dbms.connector.bolt.enabled='):
                     line = "dbms.connector.bolt.enabled=true\n"
                 elif line.strip().startswith('#dbms.connector.bolt.tls_level='):
                     line = "dbms.connector.bolt.tls_level=DISABLED\n"
                 elif line.strip().startswith('#dbms.connector.bolt.listen_address='):
-                    line = f"dbms.connector.bolt.listen_address=0.0.0.0:{self.NEO4J_PORT}\n"
+                    line = f"dbms.connector.bolt.listen_address=localhost:{self.NEO4J_PORT}\n"
+                # Disable HTTP connector to avoid port conflicts
+                elif line.strip().startswith('#dbms.connector.http.enabled='):
+                    line = "dbms.connector.http.enabled=false\n"
                 # Configure memory settings for better vector operations
                 elif line.strip().startswith('#dbms.memory.heap.initial_size='):
-                    line = "dbms.memory.heap.initial_size=512m\n"
+                    line = "dbms.memory.heap.initial_size=256m\n"
                 elif line.strip().startswith('#dbms.memory.heap.max_size='):
-                    line = "dbms.memory.heap.max_size=1G\n"
+                    line = "dbms.memory.heap.max_size=512m\n"
                 elif line.strip().startswith('#dbms.memory.pagecache.size='):
-                    line = "dbms.memory.pagecache.size=512m\n"
+                    line = "dbms.memory.pagecache.size=256m\n"
                 
                 new_config_lines.append(line)
             
@@ -721,6 +750,10 @@ class EmbeddedNeo4jServer:
             new_config_lines.append("\n# Enable REDUCE functionality for vector similarity calculations\n")
             new_config_lines.append("dbms.cypher.forbid_exhaustive_shortestpath=false\n")
             new_config_lines.append("dbms.cypher.min_replan_interval=0\n")
+            
+            # Add explicit configuration to ensure Bolt connector works reliably
+            new_config_lines.append("\n# Ensure reliable connections\n")
+            new_config_lines.append("dbms.connector.bolt.address=localhost:7687\n")
             
             # Write the modified configuration
             with open(config_path, 'w') as f:
@@ -762,8 +795,8 @@ class EmbeddedNeo4jServer:
                             f.write(f"\n# Custom Java path\n")
                             f.write(f"wrapper.java.command={java_path}/bin/java\n")
                             # Add JVM heap settings for better performance with vectors
-                            f.write(f"wrapper.java.additional=-Xms512m\n")
-                            f.write(f"wrapper.java.additional=-Xmx1g\n")
+                            f.write(f"wrapper.java.additional=-Xms256m\n")
+                            f.write(f"wrapper.java.additional=-Xmx512m\n")
                 except Exception as e:
                     log_message(f"Error configuring Java path: {str(e)}", True)
             
@@ -777,6 +810,9 @@ class EmbeddedNeo4jServer:
     def start(self):
         """Start the Neo4j server process"""
         try:
+            # First kill any stale processes
+            self.kill_stale_processes()
+            
             # Check if Java is available
             java_ok, java_message = self.check_java_version()
             if not java_ok:
@@ -849,7 +885,8 @@ class EmbeddedNeo4jServer:
             )
             
             # Set initial startup wait time based on platform
-            startup_wait = 5 if platform.system().lower() == "darwin" else 3
+            # macOS needs more time to properly initialize Neo4j
+            startup_wait = 15 if platform.system().lower() == "darwin" else 5
             log_message(f"Waiting {startup_wait} seconds for Neo4j to start...")
             
             # Capture output during startup
@@ -1131,33 +1168,108 @@ class EmbeddedNeo4jServer:
             return os.path.exists(os.path.join(self.server_dir, "bin", "neo4j"))
     
     def cleanup_database_files(self):
-        """Clean up database files to resolve corruption issues"""
+        """Clean up database files to avoid corruption issues"""
         try:
             log_message("Cleaning up database files to resolve potential corruption...")
-            data_path = self.data_dir
-
-            # Remove the database directories which might be corrupted
-            databases_dir = os.path.join(data_path, "databases")
-            transactions_dir = os.path.join(data_path, "transactions")
             
-            if os.path.exists(databases_dir):
-                shutil.rmtree(databases_dir)
-                log_message("Removed databases directory")
-                
-            if os.path.exists(transactions_dir):
-                shutil.rmtree(transactions_dir)
-                log_message("Removed transactions directory")
-                
-            # Create fresh directories
-            os.makedirs(databases_dir, exist_ok=True)
-            os.makedirs(transactions_dir, exist_ok=True)
+            # Clean up store_lock files that can cause lock issues
+            data_dir = os.path.join(self.base_path, "Neo4jDB", "data")
+            if os.path.exists(data_dir):
+                # Remove store_lock files that might be causing issues
+                for root, dirs, files in os.walk(data_dir):
+                    for file in files:
+                        if file == "store_lock" or file.endswith(".lock"):
+                            lock_file = os.path.join(root, file)
+                            try:
+                                os.remove(lock_file)
+                                log_message(f"Removed lock file: {lock_file}")
+                            except Exception as e:
+                                log_message(f"Error removing lock file {lock_file}: {str(e)}", True)
+            
+            # Remove databases directory
+            db_dir = os.path.join(self.base_path, "Neo4jDB", "data", "databases")
+            if os.path.exists(db_dir):
+                try:
+                    shutil.rmtree(db_dir)
+                    log_message("Removed databases directory")
+                except Exception as e:
+                    log_message(f"Error removing databases directory: {str(e)}", True)
+            
+            # Remove transactions directory
+            tx_dir = os.path.join(self.base_path, "Neo4jDB", "data", "transactions")
+            if os.path.exists(tx_dir):
+                try:
+                    shutil.rmtree(tx_dir)
+                    log_message("Removed transactions directory")
+                except Exception as e:
+                    log_message(f"Error removing transactions directory: {str(e)}", True)
+                    
+            # Wait a moment to ensure file system operations complete
+            time.sleep(1)
             
             log_message("Database cleanup completed")
             return True
         except Exception as e:
             log_message(f"Error during database cleanup: {str(e)}", True)
-            log_message(traceback.format_exc(), True)
             return False
+
+    def kill_stale_processes(self):
+        """Kill any running Neo4j Java processes that might interfere with startup"""
+        try:
+            log_message("Checking for stale Neo4j processes...")
+            
+            # Function to find and kill processes based on platform
+            if platform.system().lower() == "darwin":  # macOS
+                # First, check for the existence of any Neo4j Java processes
+                try:
+                    # Look for Java processes containing "neo4j"
+                    check_cmd = ["pgrep", "-f", "neo4j"]
+                    proc = subprocess.run(check_cmd, capture_output=True, text=True)
+                    
+                    if proc.stdout.strip():
+                        log_message(f"Found {len(proc.stdout.strip().split())} potential Neo4j processes")
+                        
+                        # Get PIDs
+                        pids = proc.stdout.strip().split()
+                        for pid in pids:
+                            try:
+                                # Get more info about the process
+                                ps_cmd = ["ps", "-p", pid, "-o", "command"]
+                                proc_info = subprocess.run(ps_cmd, capture_output=True, text=True)
+                                
+                                # Only kill if it's definitely a Neo4j process
+                                if "neo4j" in proc_info.stdout.lower():
+                                    kill_cmd = ["kill", "-9", pid]
+                                    subprocess.run(kill_cmd)
+                                    log_message(f"Killed Neo4j process with PID {pid}")
+                            except Exception as e:
+                                log_message(f"Error processing PID {pid}: {str(e)}", True)
+                    else:
+                        log_message("No stale Neo4j processes found")
+                        
+                except Exception as e:
+                    log_message(f"Error checking for Neo4j processes: {str(e)}", True)
+                    
+            elif platform.system().lower() == "windows":
+                # For Windows, use taskkill to find and terminate Neo4j Java processes
+                try:
+                    # Find Java processes
+                    check_cmd = ["tasklist", "/FI", "IMAGENAME eq java.exe", "/FO", "CSV"]
+                    proc = subprocess.run(check_cmd, capture_output=True, text=True)
+                    
+                    # Check output for Neo4j related processes
+                    if "java.exe" in proc.stdout:
+                        log_message("Found Java processes, checking for Neo4j")
+                        # Kill only the Neo4j related ones
+                        kill_cmd = ["taskkill", "/F", "/FI", "IMAGENAME eq java.exe", "/FI", "WINDOWTITLE eq *neo4j*"]
+                        subprocess.run(kill_cmd, capture_output=True)
+                        log_message("Killed stale Neo4j Java processes")
+                except Exception as e:
+                    log_message(f"Error killing stale processes on Windows: {str(e)}", True)
+            
+            log_message("Process cleanup completed")
+        except Exception as e:
+            log_message(f"Error while killing stale processes: {str(e)}", True)
 
 # Dialog for managing document priorities
 class DocumentPriorityDialog(wx.Dialog):
@@ -1395,6 +1507,9 @@ class ResearchAssistantApp(wx.Frame):
         
         # Register close handler
         self.Bind(wx.EVT_CLOSE, self.on_close)
+        
+        # Show the window
+        self.Show()
     
     def initialize_database(self):
         """Initialize the Neo4j database connection"""
@@ -1429,8 +1544,8 @@ class ResearchAssistantApp(wx.Frame):
             
     def _start_neo4j_server_with_retry(self):
         """Start Neo4j server with retry logic"""
-        max_retries = 2
-        timeout_seconds = 30  # Set a timeout of 30 seconds for the entire operation
+        max_retries = 3
+        timeout_seconds = 60  # Increase timeout to 60 seconds for slower systems
         
         # Create a flag to track timeout
         self.neo4j_startup_timed_out = False
@@ -1485,7 +1600,7 @@ class ResearchAssistantApp(wx.Frame):
                     # Server started successfully, now initialize the database manager
                     try:
                         # Use a slight delay to ensure the server is ready
-                        time.sleep(2)
+                        time.sleep(5)
                         
                         # Check if timeout occurred
                         if self.neo4j_startup_timed_out:
@@ -1493,6 +1608,7 @@ class ResearchAssistantApp(wx.Frame):
                             return
                         
                         # Initialize database manager with auth disabled
+                        log_message("Attempting to connect to Neo4j...")
                         self.db_manager = Neo4jDatabaseManager(
                             uri=f"bolt://localhost:{self.neo4j_server.NEO4J_PORT}",
                             username="neo4j",
@@ -1501,18 +1617,25 @@ class ResearchAssistantApp(wx.Frame):
                         )
                         
                         # Test connection
-                        if self.db_manager.connected:
-                            log_message("Neo4j database initialized successfully")
-                            # Cancel the timeout timer as we've succeeded
-                            timer.cancel()
-                            # Initialize embeddings and vector store
-                            self.initialize_embeddings()
-                            
-                            # Post success event to main thread
-                            wx.PostEvent(self, DbInitEvent(success=True))
-                            return
-                        else:
-                            log_message("Neo4j manager could not connect to server", True)
+                        connection_retries = 3
+                        for conn_attempt in range(connection_retries):
+                            if self.db_manager.connected:
+                                log_message(f"Neo4j database connection successful on attempt {conn_attempt+1}")
+                                # Cancel the timeout timer as we've succeeded
+                                timer.cancel()
+                                # Initialize embeddings and vector store
+                                self.initialize_embeddings()
+                                
+                                # Post success event to main thread
+                                wx.PostEvent(self, DbInitEvent(success=True))
+                                return
+                            else:
+                                log_message(f"Connection attempt {conn_attempt+1} failed, retrying...")
+                                time.sleep(3)
+                                # Try to reconnect
+                                self.db_manager.connect()
+                        
+                        log_message("Neo4j manager could not connect to server after multiple attempts", True)
                     except Exception as e:
                         log_message(f"Error connecting to Neo4j server: {str(e)}", True)
                     
@@ -1759,35 +1882,48 @@ class ResearchAssistantApp(wx.Frame):
     
     def on_db_init_event(self, event):
         """Handle database initialization event"""
-        try:
-            success = event.success
+        if event.success:
+            log_message("Database initialization successful")
+            self.db_initialized = True
             
-            if success:
-                log_message("Database initialization successful")
-                # Update UI to reflect success
-                wx.CallAfter(lambda: self.db_status.SetLabel("Database: Ready"))
-                # Enable RAG toggle
-                wx.CallAfter(lambda: self.rag_toggle.Enable(True))
-                # Initialize RAG chains
-                threading.Thread(target=self.initialize_rag_chains, daemon=True).start()
-            else:
-                error_msg = getattr(event, 'error', "Unknown error")
-                log_message(f"Database initialization failed: {error_msg}", True)
-                # Update UI to reflect failure but allow app to continue
-                wx.CallAfter(lambda: self.db_status.SetLabel(f"Database: Failed"))
-                wx.CallAfter(lambda: self.rag_toggle.Enable(False))
-                wx.CallAfter(lambda: self.rag_toggle.SetValue(False))
-                # Show a warning to the user but allow them to continue using basic functionality
-                wx.CallAfter(lambda: wx.MessageBox(
-                    f"Neo4j database initialization failed: {error_msg}\n\n"
-                    "You can still use basic document functionality but RAG/GraphRAG features will be disabled.",
-                    "Database Warning",
-                    wx.OK | wx.ICON_WARNING
-                ))
-        except Exception as e:
-            log_message(f"Error handling database initialization event: {str(e)}", True)
-            log_message(traceback.format_exc(), True)
-
+            # Initialize RAG chains
+            self.initialize_rag_chains()
+        else:
+            log_message(f"Database initialization failed: {event.error}", True)
+            
+            # Even though Neo4j failed, we'll set up a minimal UI to allow document functionality
+            # without the RAG/GraphRAG features
+            wx.MessageBox(
+                f"Neo4j database initialization failed: {event.error}\n\n"
+                "You can still use basic document functionality but RAG/GraphRAG features will be disabled.",
+                "Database Error",
+                wx.OK | wx.ICON_WARNING
+            )
+            
+            # Create an empty placeholder for the DB manager if needed
+            if not hasattr(self, 'db_manager') or self.db_manager is None:
+                class DummyManager:
+                    def __init__(self):
+                        self.connected = False
+                        
+                    def close(self):
+                        pass
+                        
+                self.db_manager = DummyManager()
+            
+            # Setup basic UI without database features
+            if hasattr(self, 'rag_toggle'):
+                self.rag_toggle.Enable(False)
+            if hasattr(self, 'rag_type_choice'):
+                self.rag_type_choice.Enable(False)
+            
+            # Create a basic handler for the rag chain to avoid errors
+            def dummy_rag_chain(query):
+                return "RAG features are disabled because Neo4j database failed to initialize."
+                
+            self.rag_chain = dummy_rag_chain
+            self.graph_chain = dummy_rag_chain
+    
     def initialize_rag_chains(self):
         """Initialize RAG chains for document querying"""
         try:
