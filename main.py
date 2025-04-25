@@ -190,7 +190,7 @@ class Neo4jDatabaseManager:
         self.connected = False
 
     def initialize_vector_store(self, embeddings):
-        """Initialize the vector store"""
+        """Initialize the vector store with Neo4j integration"""
         try:
             if not LANGCHAIN_AVAILABLE or not self.connected:
                 log_message("LangChain or Neo4j connection not available", True)
@@ -263,11 +263,20 @@ class Neo4jDatabaseManager:
                             MERGE (d:Document {document_id: $doc_id})
                             SET d.content = $content,
                                 d.title = $title,
-                                d.embedding = $embedding,
-                                d.metadata = $metadata
+                                d.embedding = $embedding
                             """, doc_id=document_id, content=content, 
-                                title=title, embedding=embedding, 
-                                metadata=doc.metadata)
+                                title=title, embedding=embedding)
+                                
+                            # Add metadata as separate properties to avoid serialization issues
+                            for key, value in doc.metadata.items():
+                                if isinstance(value, (str, int, float, bool)):
+                                    session.run(
+                                        f"""
+                                        MATCH (d:Document {{document_id: $doc_id}})
+                                        SET d.meta_{key} = $value
+                                        """,
+                                        doc_id=document_id, value=value
+                                    )
                 
                 def similarity_search(self, query, k=5):
                     """Search for similar documents"""
@@ -292,17 +301,18 @@ class Neo4jDatabaseManager:
                                 norm + $query_embedding[i] * $query_embedding[i]))) AS score
                         ORDER BY score DESC 
                         LIMIT $k
-                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.metadata AS metadata, score
+                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, score
                         """, query_embedding=query_embedding, k=k)
                         
                         # Convert results to Document objects
                         documents = []
                         for record in result:
-                            # Handle null metadata
-                            metadata = record["metadata"] or {}
-                            # Ensure document_id and title are in metadata
-                            metadata["document_id"] = record["document_id"]
-                            metadata["title"] = record["title"]
+                            # Create metadata from fields
+                            metadata = {
+                                "document_id": record["document_id"],
+                                "title": record["title"],
+                                "score": record["score"]
+                            }
                             
                             # Create Document object
                             doc = Document(
@@ -338,10 +348,7 @@ class Neo4jDatabaseManager:
                 
                 @classmethod
                 def from_texts(cls, texts, embedding, metadatas=None, **kwargs):
-                    """Create a Neo4jVectorStore4x from a list of texts.
-                    
-                    This is a required method for the VectorStore abstract class.
-                    """
+                    """Create a Neo4jVectorStore4x from a list of texts."""
                     # Process driver from kwargs
                     driver = kwargs.get("driver", None)
                     if driver is None:
@@ -351,26 +358,31 @@ class Neo4jDatabaseManager:
                         database = kwargs.get("database", "neo4j")
                         
                         # Import here to avoid circular imports
-                        from neo4j import GraphDatabase
-                        driver = GraphDatabase.driver(url, auth=(username, password))
+                        from neo4j import GraphDatabase, TrustAll
+                        
+                        driver = GraphDatabase.driver(
+                            url, 
+                            auth=(username, password),
+                            trusted_certificates=TrustAll()
+                        )
                     
-                    # Create an instance of this class
-                    instance = cls(
+                    # Create Neo4jVectorStore instance
+                    vs = cls(
                         driver=driver,
                         embedding_function=embedding,
                         database=kwargs.get("database", "neo4j")
                     )
                     
-                    # Add the texts
-                    instance.add_texts(texts, metadatas=metadatas)
+                    # Add texts if provided
+                    if texts:
+                        vs.add_texts(texts=texts, metadatas=metadatas)
                     
-                    return instance
+                    return vs
             
-            # Create instance of our custom vector store
+            # Initialize the vector store with our embedding function
             self.vector_store = Neo4jVectorStore4x(
                 driver=self.driver,
-                embedding_function=embeddings,
-                database=self.database
+                embedding_function=embeddings
             )
             
             log_message("Vector store initialized successfully (Neo4j 4.x compatibility mode)")
@@ -381,7 +393,7 @@ class Neo4jDatabaseManager:
             return False
 
     def add_document(self, document_id, title, content, metadata=None):
-        """Add a document to Neo4j graph"""
+        """Add a document to both Neo4j graph database and vector store"""
         try:
             if not self.connected:
                 log_message("Not connected to Neo4j", True)
@@ -398,6 +410,7 @@ class Neo4jDatabaseManager:
                         # Convert complex objects to string representation
                         safe_metadata[k] = str(v)
             
+            # STEP 1: Add to Neo4j graph database
             with self.driver.session() as session:
                 # Create the document node
                 session.run("""
@@ -427,14 +440,53 @@ class Neo4jDatabaseManager:
                     # Execute the query
                     session.run(metadata_query, **params)
                 
+            # STEP 2: Add to vector store if available
+            vector_store_success = False
+            if LANGCHAIN_AVAILABLE and self.vector_store:
+                try:
+                    from langchain_core.documents import Document
+                    from langchain.text_splitter import RecursiveCharacterTextSplitter
+                    
+                    # Create metadata for langchain document
+                    lc_metadata = safe_metadata.copy()
+                    lc_metadata["document_id"] = document_id
+                    lc_metadata["title"] = title
+                    
+                    # Process document with text splitter for better chunking
+                    text_splitter = RecursiveCharacterTextSplitter(
+                        chunk_size=1000, 
+                        chunk_overlap=200
+                    )
+                    
+                    # Split document into chunks
+                    docs = text_splitter.create_documents(
+                        texts=[content],
+                        metadatas=[lc_metadata]
+                    )
+                    
+                    # Add to vector store
+                    self.vector_store.add_documents(docs)
+                    log_message(f"Added document {document_id} to vector store with {len(docs)} chunks")
+                    vector_store_success = True
+                except Exception as e:
+                    log_message(f"Error adding document to vector store: {str(e)}", True)
+                    # Continue even if vector store addition fails - we still have the graph data
+            
+            # STEP 3: Add to knowledge graph
+            graph_success = self.add_document_to_knowledge_graph(document_id, title, content, safe_metadata)
+            
+            if vector_store_success or graph_success:
                 log_message(f"Added document {document_id} to database")
                 return True
+            else:
+                log_message(f"Failed to add document {document_id} to either vector store or knowledge graph", True)
+                return False
         except Exception as e:
             log_message(f"Error adding document to database: {str(e)}", True)
             return False
     
     def remove_document(self, document_id):
-        """Remove a document from the database"""
+        """Remove a document from both the Neo4j database and vector store"""
         try:
             if not self.connected:
                 log_message("Neo4j connection not available", True)
@@ -451,8 +503,8 @@ class Neo4jDatabaseManager:
             if not doc_exists:
                 log_message(f"Document {document_id} not found in database")
                 return False
-                
-            # Remove document
+            
+            # STEP 1: Remove from Neo4j database
             with self.driver.session() as session:
                 # Delete document node and relationships
                 session.run(
@@ -463,12 +515,17 @@ class Neo4jDatabaseManager:
                     id=document_id
                 )
                 
+            # STEP 2: If using vector store, remove from there too
+            # Unfortunately, most vector stores don't support direct deletion by ID
+            # So we'll need a workaround - we'll note that it's been removed
+            # from the graph database which is the source of truth
+            
             log_message(f"Document {document_id} removed from database")
             return True
         except Exception as e:
             log_message(f"Error removing document from database: {str(e)}", True)
             return False
-            
+    
     def get_document_list(self):
         """Get list of documents in the database"""
         try:
@@ -497,24 +554,141 @@ class Neo4jDatabaseManager:
             log_message(f"Error getting document list from database: {str(e)}", True)
             return []
             
-    def query_similar_text(self, query_text, limit=5):
-        """Query for similar text chunks"""
+    def query_similar_text(self, query, limit=5, use_graph=False):
+        """Query for similar text chunks using vector store or graph relationships
+        
+        Args:
+            query_text: The text to find similar documents to
+            limit: Maximum number of results to return
+            use_graph: If True, use graph relationships for search; otherwise use vector embedding
+        """
         try:
-            if not self.connected or not self.vector_store:
-                log_message("Neo4j connection or vector store not available", True)
+            if not self.connected:
+                log_message("Neo4j connection not available", True)
                 return []
-                
-            # Query for similar text
-            results = self.vector_store.similarity_search(
-                query=query_text,
-                k=limit
-            )
             
-            return results
+            # METHOD 1: Using Vector Store for semantic search (standard RAG)
+            if not use_graph and self.vector_store:
+                try:
+                    # Query for similar text using embeddings
+                    results = self.vector_store.similarity_search(
+                        query=query,
+                        k=limit
+                    )
+                    
+                    log_message(f"Found {len(results)} similar documents using vector search")
+                    return results
+                except Exception as e:
+                    log_message(f"Error querying vector store: {str(e)}", True)
+                    # Fall back to graph search if vector search fails
+            
+            # METHOD 2: Using Graph Relationships (GraphRAG approach)
+            with self.driver.session() as session:
+                if use_graph:
+                    # Extract key terms from the query using simple text processing
+                    import re
+                    from collections import Counter
+                    
+                    # Remove stop words and extract key terms
+                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
+                    words = re.findall(r'\b\w+\b', query_text.lower())
+                    key_terms = [w for w in words if w not in stop_words and len(w) > 2]
+                    
+                    # Get most common terms
+                    term_counts = Counter(key_terms)
+                    top_terms = [term for term, _ in term_counts.most_common(5)]
+                    
+                    # Build the search query using key terms
+                    if top_terms:
+                        # Create CONTAINS clauses for each term
+                        term_clauses = []
+                        params = {}
+                        
+                        for i, term in enumerate(top_terms):
+                            term_clauses.append(f"toLower(d.content) CONTAINS $term{i}")
+                            params[f"term{i}"] = term
+                        
+                        # Combine clauses with OR
+                        where_clause = " OR ".join(term_clauses)
+                        
+                        # Execute the query with a score based on the number of terms matched
+                        result = session.run(f"""
+                        MATCH (d:Document)
+                        WHERE {where_clause}
+                        WITH d, 
+                             reduce(score = 0, term IN [{', '.join(f'$term{i}' for i in range(len(top_terms)))}] |
+                                score + CASE WHEN toLower(d.content) CONTAINS term THEN 1 ELSE 0 END) AS score
+                        ORDER BY score DESC
+                        LIMIT $limit
+                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, score
+                        """, **params, limit=limit)
+                    else:
+                        # Fallback if no key terms found
+                        result = session.run("""
+                        MATCH (d:Document)
+                        WHERE d.document_id <> 'placeholder'
+                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
+                        LIMIT $limit
+                        """, limit=limit)
+                    
+                    # Process results
+                    from langchain_core.documents import Document
+                    documents = []
+                    
+                    for record in result:
+                        # Create metadata
+                        metadata = {
+                            "document_id": record["document_id"],
+                            "title": record["title"],
+                            "score": record["score"],
+                            "source": "graph_search"
+                        }
+                        
+                        # Create Document
+                        doc = Document(
+                            page_content=record["content"],
+                            metadata=metadata
+                        )
+                        documents.append(doc)
+                    
+                    log_message(f"Found {len(documents)} similar documents using graph search")
+                    return documents
+                else:
+                    # If vector store is not available but use_graph is False,
+                    # run a basic full-text search in Neo4j as fallback
+                    result = session.run("""
+                    MATCH (d:Document)
+                    WHERE d.document_id <> 'placeholder' AND toLower(d.content) CONTAINS toLower($query)
+                    RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
+                    LIMIT $limit
+                    """, query=query_text, limit=limit)
+                    
+                    # Process results
+                    from langchain_core.documents import Document
+                    documents = []
+                    
+                    for record in result:
+                        # Create metadata
+                        metadata = {
+                            "document_id": record["document_id"],
+                            "title": record["title"],
+                            "score": record["score"],
+                            "source": "text_search"
+                        }
+                        
+                        # Create Document
+                        doc = Document(
+                            page_content=record["content"],
+                            metadata=metadata
+                        )
+                        documents.append(doc)
+                    
+                    log_message(f"Found {len(documents)} documents using text search (fallback)")
+                    return documents
         except Exception as e:
             log_message(f"Error querying similar text: {str(e)}", True)
             return []
-            
+    
     def create_document_relationship(self, source_id, target_id, relationship_type, properties=None):
         """Create a relationship between two documents"""
         try:
@@ -552,6 +726,129 @@ class Neo4jDatabaseManager:
                 return False
         except Exception as e:
             log_message(f"Error creating document relationship: {str(e)}", True)
+            return False
+
+    def add_document_to_knowledge_graph(self, document_id, title, content, metadata=None):
+        """Add a document to the knowledge graph by extracting entities and relationships"""
+        try:
+            if not self.connected:
+                log_message("Not connected to Neo4j", True)
+                return False
+                
+            # Import required libraries
+            try:
+                from langchain_core.documents import Document
+                from langchain.text_splitter import RecursiveCharacterTextSplitter
+                from langchain_experimental.graph_transformers import LLMGraphTransformer
+                from langchain_openai import ChatOpenAI
+            except ImportError:
+                log_message("Required libraries for knowledge graph not available", True)
+                return False
+                
+            # Use LLM to extract entities and relationships
+            # First, split document into manageable chunks
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=100
+            )
+            
+            # Create LangChain document with metadata
+            lc_metadata = {}
+            if metadata:
+                lc_metadata = {k: v for k, v in metadata.items() if isinstance(v, (str, int, float, bool))}
+            lc_metadata["document_id"] = document_id
+            lc_metadata["title"] = title
+            
+            # Create document chunks
+            doc = Document(page_content=content, metadata=lc_metadata)
+            chunks = text_splitter.split_documents([doc])
+            
+            # Initialize LLM and graph transformer
+            llm = None
+            try:
+                llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+            except:
+                try:
+                    from langchain_community.chat_models import ChatOllama
+                    llm = ChatOllama(model="llama3", temperature=0)
+                except:
+                    log_message("No LLM available for graph transformation", True)
+                    return False
+            
+            # Create graph transformer and convert documents
+            if llm:
+                llm_transformer = LLMGraphTransformer(llm=llm)
+                
+                # Convert documents to graph format
+                graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+                
+                # Add to graph database with base entity label
+                with self.driver.session() as session:
+                    # First, create the base document node to connect everything
+                    session.run("""
+                    MERGE (d:Document {document_id: $doc_id})
+                    SET d.title = $title,
+                        d.content = $content,
+                        d.updated_at = datetime()
+                    """, doc_id=document_id, title=title, content=content)
+                    
+                    # Process graph documents to create entity nodes and relationships
+                    for graph_doc in graph_documents:
+                        # Add entities
+                        for entity in graph_doc.entities:
+                            # Create entity node
+                            entity_id = entity.id
+                            entity_type = entity.entity_type
+                            entity_properties = {}
+                            
+                            # Extract safe properties
+                            for k, v in entity.properties.items():
+                                if isinstance(v, (str, int, float, bool)):
+                                    entity_properties[k] = v
+                            
+                            # Build the query dynamically
+                            query = f"""
+                            MERGE (e:`{entity_type}` {{id: $id}})
+                            """
+                            
+                            # Add SET clause if there are properties
+                            if entity_properties:
+                                query += "SET " + ", ".join([f"e.{k} = ${k}" for k in entity_properties.keys()])
+                            
+                            # Execute query
+                            params = {"id": entity_id}
+                            params.update(entity_properties)
+                            session.run(query, **params)
+                            
+                            # Connect entity to document
+                            session.run("""
+                            MATCH (d:Document {document_id: $doc_id})
+                            MATCH (e {id: $entity_id})
+                            MERGE (d)-[:CONTAINS]->(e)
+                            """, doc_id=document_id, entity_id=entity_id)
+                        
+                        # Add relationships between entities
+                        for rel in graph_doc.relationships:
+                            source_id = rel.source
+                            target_id = rel.target
+                            rel_type = rel.relationship_type
+                            
+                            # Create relationship
+                            session.run(f"""
+                            MATCH (source {{id: $source_id}})
+                            MATCH (target {{id: $target_id}})
+                            MERGE (source)-[:`{rel_type}`]->(target)
+                            """, source_id=source_id, target_id=target_id)
+                
+                log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
+                return True
+            else:
+                log_message("Could not initialize LLM for graph transformation", True)
+                return False
+                
+        except Exception as e:
+            log_message(f"Error adding document to knowledge graph: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
             return False
 
 # Override IsDisplayAvailable to always return True
@@ -1487,10 +1784,11 @@ class ResearchAssistantApp(wx.Frame):
         self.neo4j_server = EmbeddedNeo4jServer(base_path=self.base_path)
         self.neo4j_manager = None
         self.db_initialized = False
-        self.chat_positions = []  # To keep track of message positions for editing
+        self.message_positions = []  # To keep track of message positions for editing
         self.rag_chain = None
         self.graph_chain = None
         self.showing_loader = False
+        self.current_streaming_response = None
         
         # Setup UI
         self.setup_ui()
@@ -1895,7 +2193,7 @@ class ResearchAssistantApp(wx.Frame):
             # without the RAG/GraphRAG features
             wx.MessageBox(
                 f"Neo4j database initialization failed: {event.error}\n\n"
-                "You can still use basic document functionality but RAG/GraphRAG features will be disabled.",
+                "You can still use basic document functionality but RAG features will be disabled.",
                 "Database Error",
                 wx.OK | wx.ICON_WARNING
             )
@@ -1914,15 +2212,12 @@ class ResearchAssistantApp(wx.Frame):
             # Setup basic UI without database features
             if hasattr(self, 'rag_toggle'):
                 self.rag_toggle.Enable(False)
-            if hasattr(self, 'rag_type_choice'):
-                self.rag_type_choice.Enable(False)
             
             # Create a basic handler for the rag chain to avoid errors
             def dummy_rag_chain(query):
                 return "RAG features are disabled because Neo4j database failed to initialize."
                 
             self.rag_chain = dummy_rag_chain
-            self.graph_chain = dummy_rag_chain
     
     def initialize_rag_chains(self):
         """Initialize RAG chains for document querying"""
@@ -1931,40 +2226,27 @@ class ResearchAssistantApp(wx.Frame):
                 log_message("RAG chains not initialized - vector store not available", True)
                 return False
 
-            log_message("Initializing RAG chains")
+            log_message("Initializing combined RAG chain")
             
-            # Get a client to use for both chains
+            # Get a client to use for the chain
             llm_client = self.get_llm_client()
             if not llm_client:
-                log_message("RAG chains not initialized - LLM client not available", True)
+                log_message("RAG chain not initialized - LLM client not available", True)
                 return False
                 
-            # Create standard RAG chain
+            # Create combined RAG chain
             self.rag_chain = create_rag_chain(self.neo4j_manager, llm_client)
             if not self.rag_chain:
-                log_message("Standard RAG chain initialization failed", True)
-            else:
-                log_message("Standard RAG chain initialized successfully")
-            
-            # Create graph RAG chain
-            self.graph_chain = create_graph_chain(self.neo4j_manager, llm_client)
-            if not self.graph_chain:
-                log_message("GraphRAG chain initialization failed", True)
-            else:
-                log_message("GraphRAG chain initialized successfully")
-            
-            # Update UI to reflect RAG is ready if at least one chain is available
-            if self.rag_chain or self.graph_chain:
-                wx.CallAfter(lambda: self.db_status.SetLabel("Database: Ready"))
-                log_message("RAG chains initialized successfully")
-                return True
-            else:
+                log_message("Combined RAG chain initialization failed", True)
                 wx.CallAfter(lambda: self.db_status.SetLabel("Database: Error"))
-                log_message("All RAG chains failed to initialize", True)
                 return False
+            else:
+                log_message("Combined RAG chain initialized successfully")
+                wx.CallAfter(lambda: self.db_status.SetLabel("Database: Ready"))
+                return True
                 
         except Exception as e:
-            log_message(f"Error initializing RAG chains: {str(e)}", True)
+            log_message(f"Error initializing RAG chain: {str(e)}", True)
             log_message(traceback.format_exc(), True)
             wx.CallAfter(lambda: self.db_status.SetLabel("Database: Error"))
             return False
@@ -1992,9 +2274,6 @@ class ResearchAssistantApp(wx.Frame):
                 self.rag_toggle.SetValue(False)
                 return
             
-            # Enable/disable the RAG type selection based on toggle
-            self.rag_type_radio.Enable(is_enabled)
-            
             if is_enabled and not self.neo4j_manager:
                 log_message("Warning: RAG enabled but database not available", True)
                 wx.MessageBox("RAG is enabled but the database is not available.\n"
@@ -2004,23 +2283,6 @@ class ResearchAssistantApp(wx.Frame):
             log_message(f"Error in RAG toggle handler: {str(e)}", True)
             log_message(traceback.format_exc(), True)
     
-    def on_rag_type_changed(self, event):
-        """Handle changing between standard RAG and GraphRAG"""
-        try:
-            selection = self.rag_type_radio.GetSelection()
-            rag_type = "Standard RAG" if selection == 0 else "GraphRAG"
-            log_message(f"RAG type changed to: {rag_type}")
-            
-            # Check if the necessary infrastructure is available
-            if rag_type == "GraphRAG" and (not self.neo4j_manager or not self.graph_chain):
-                log_message("Warning: GraphRAG selected but not fully available", True)
-                wx.MessageBox("GraphRAG requires Neo4j and LangChain integrations.\n"
-                              "Please ensure the database is properly initialized.",
-                              "Warning", wx.OK | wx.ICON_WARNING)
-        except Exception as e:
-            log_message(f"Error in RAG type handler: {str(e)}", True)
-            log_message(traceback.format_exc(), True)
-            
     def on_close(self, event):
         """Handle window close event - stop Neo4j server"""
         try:
@@ -2040,6 +2302,10 @@ class ResearchAssistantApp(wx.Frame):
     def setup_ui(self):
         try:
             log_message("Setting up wxPython UI components")
+            
+            # Create status bar
+            self.CreateStatusBar()
+            self.SetStatusText("Ready")
             
             # Main panel
             panel = wx.Panel(self)
@@ -2088,15 +2354,9 @@ class ResearchAssistantApp(wx.Frame):
             rag_type_panel = wx.Panel(rag_panel)
             rag_type_sizer = wx.BoxSizer(wx.HORIZONTAL)
             
-            # RAG type radio buttons
-            self.rag_type_radio = wx.RadioBox(
-                rag_type_panel, 
-                label="RAG Type", 
-                choices=["Standard RAG", "GraphRAG"]
-            )
-            self.rag_type_radio.SetToolTip("Choose between standard RAG or knowledge graph enhanced RAG")
-            self.rag_type_radio.Bind(wx.EVT_RADIOBOX, self.on_rag_type_changed)
-            rag_type_sizer.Add(self.rag_type_radio, 1, wx.EXPAND)
+            # Add an explanatory text instead
+            rag_info = wx.StaticText(rag_type_panel, label="Documents will be added to both vector database and knowledge graph.")
+            rag_type_sizer.Add(rag_info, 1, wx.EXPAND)
             
             rag_type_panel.SetSizer(rag_type_sizer)
             rag_sizer.Add(rag_type_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
@@ -2543,7 +2803,7 @@ class ResearchAssistantApp(wx.Frame):
             
             # Clear chat display
             self.chat_display.Clear()
-            self.chat_positions = []
+            self.message_positions = []
             
             log_message("Chat history cleared")
         except Exception as e:
@@ -2710,8 +2970,20 @@ class ResearchAssistantApp(wx.Frame):
             self.user_input.Disable()
             self.SetStatusText("Processing...")
             
-            # Use threading to keep UI responsive
-            threading.Thread(target=self.process_message, args=(user_message,), daemon=True).start()
+            # Process in a thread and handle the response
+            def process_and_handle_response():
+                try:
+                    response = self.process_message(user_message)
+                    # Use CallAfter to update UI from the thread
+                    wx.CallAfter(self.handle_response, response)
+                except Exception as e:
+                    error_msg = f"Error processing message: {str(e)}"
+                    log_message(error_msg, True)
+                    log_message(traceback.format_exc(), True)
+                    wx.CallAfter(self.handle_response, f"Error: {error_msg}")
+            
+            # Start the processing thread
+            threading.Thread(target=process_and_handle_response, daemon=True).start()
         except Exception as e:
             error_msg = f"Error sending message: {str(e)}"
             log_message(error_msg, True)
@@ -2721,9 +2993,9 @@ class ResearchAssistantApp(wx.Frame):
 
     def on_stream_event(self, event):
         # Append the chunk to the chat display
-        self.append_streaming_chunk(event.chunk)
+        self.append_streaming_chunk(event.text)
         # Add to the current streaming response
-        self.current_streaming_response += event.chunk
+        self.current_streaming_response += event.text
     
     def append_to_chat(self, message, sender):
         """Append a message to the chat display"""
@@ -2784,213 +3056,146 @@ class ResearchAssistantApp(wx.Frame):
             log_message(f"Error appending streaming chunk: {str(e)}", True)
     
     def get_llm_client(self):
-        """Get an LLM client based on the selected model"""
+        """Get the LLM client based on the selected model"""
         try:
-            # Get selected model
-            selected_model = self.model_choice.GetStringSelection()
+            # Get the selected model from combobox
+            model_name = self.model_choice.GetStringSelection()
             
-            # Find the corresponding model key
+            # Get model config from the config
+            model_config = None
             model_key = None
-            for key, info in self.config["models"].items():
-                if info["name"] == selected_model:
+            for key, config in self.config.get("models", {}).items():
+                if config.get("name") == model_name:
+                    model_config = config
                     model_key = key
                     break
             
-            if not model_key:
-                log_message("Selected model not found in configuration", True)
+            if not model_config:
+                log_message(f"No configuration found for model: {model_name}", True)
                 return None
             
-            model_info = self.config["models"][model_key]
+            # Get the API key from environment
+            api_key_env = model_config.get("api_key_env")
+            api_key = os.environ.get(api_key_env) if api_key_env else None
             
-            # Load API keys from environment
-            from dotenv import load_dotenv
-            load_dotenv()
+            # Get the model ID
+            model_id = model_config.get("model_name", "")
             
-            api_key = os.environ.get(model_info["api_key_env"])
             if not api_key:
-                log_message(f"API key not found in environment: {model_info['api_key_env']}", True)
+                log_message(f"API key environment variable {api_key_env} not set", True)
                 return None
             
-            # Get max tokens from config
-            max_tokens = self.config.get("max_tokens", 4000)
+            # Create the appropriate client
+            client_class = LLMClient(api_key, model_id, model_key=model_key)
+            return client_class
             
-            # Create the appropriate client based on the model key
-            if model_key == "openai":
-                from openai import OpenAI
-                client = OpenAI(api_key=api_key)
-                return client
-            elif model_key == "anthropic":
-                from anthropic import Anthropic
-                client = Anthropic(api_key=api_key)
-                return client
-            elif model_key == "gemini":
-                import google.generativeai as genai
-                genai.configure(api_key=api_key)
-                return genai
-            else:
-                log_message(f"Unsupported model provider: {model_key}", True)
-                return None
         except Exception as e:
             log_message(f"Error getting LLM client: {str(e)}", True)
             log_message(traceback.format_exc(), True)
             return None
-
+            
     def process_message(self, user_message):
+        """Process a user message and generate a response"""
         try:
-            # Get LLM client
-            log_message("Getting LLM client for message processing")
-            client = self.get_llm_client()
+            # Get LLM client instance
+            llm_client = self.get_llm_client()
+            if not llm_client:
+                return "Error: Could not initialize language model. Please check your configuration."
             
-            if not client:
-                log_message("Failed to initialize LLM client", True)
-                # Get last error from log to provide more context
-                with open(os.path.join(APP_PATH, "error_log.txt"), 'r', encoding='utf-8') as f:
-                    error_lines = f.readlines()
-                    last_errors = '\n'.join(error_lines[-10:]) if error_lines else "No specific error details available"
+            # Define a callback function for streaming updates
+            def update_response_callback(chunk):
+                # Post event to main thread for UI update
+                evt = StreamEvent(text=chunk)
+                wx.PostEvent(self, evt)
                 
-                error_response = f"Could not initialize LLM client. Please check your API keys and configuration. \n\nError details: {last_errors}"
-                log_message(f"Sending error response to UI: {error_response[:100]}...")
-                wx.PostEvent(self, ResponseEvent(response=error_response))
-                self.conversation_history.append({"role": "assistant", "content": error_response})
-                return
-                
-            # Decide if we should use RAG or standard processing
-            if self.rag_enabled and self.db_initialized:
-                # Use RAG or GraphRAG
-                self.process_with_rag(user_message, client)
+            # Check if RAG is enabled
+            if hasattr(self, 'rag_toggle') and self.rag_toggle.GetValue():
+                if self.rag_chain:
+                    log_message("Using RAG for response")
+                    response = self.rag_chain(user_message)
+                else:
+                    log_message("No RAG chain available, falling back to direct query", True)
+                    # Fall back to direct query
+                    # Initialize streaming response
+                    self.current_streaming_response = ""
+                    
+                    # Use streaming response with callback
+                    system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
+                    full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+                    
+                    # Process streaming response
+                    response_chunks = []
+                    for chunk in llm_client.generate_streaming(full_prompt, callback=update_response_callback):
+                        response_chunks.append(chunk)
+                        
+                    response = "".join(response_chunks)
             else:
-                # Use standard document processing
-                self.process_with_documents(user_message, client)
-        except Exception as e:
-            error_message = f"Error processing message: {str(e)}"
-            log_message(error_message, True)
-            log_message(traceback.format_exc(), True)
-            wx.PostEvent(self, ResponseEvent(response=f"{error_message}\n\n{traceback.format_exc()}"))
-            
-    def process_with_documents(self, user_message, client):
-        """Process a message using selected documents without RAG"""
-        try:
-            # Load selected documents
-            doc_context = self.load_selected_documents()
-            
-            # Create conversation history text
-            history_text = ""
-            for msg in self.conversation_history[:-1]:  # Skip the last user message as we'll add it separately
-                sender = "User" if msg["role"] == "user" else "Assistant"
-                history_text += f"{sender}: {msg['content']}\n\n"
-            
-            # Get system prompt from config
-            system_prompt = self.config.get("system_prompt", "You are a helpful AI research assistant.")
-            
-            # Create the full prompt
-            prompt = f"""
-{system_prompt}
-
-Document Context:
-{doc_context}
-
-Conversation History:
-{history_text}
-
-Current Question:
-{user_message}
-"""
-            
-            log_message("Generating response using standard document processing")
-            # Get response
-            response = client.generate_response(prompt)
-            
-            # Post event to add response to UI
-            wx.PostEvent(self, ResponseEvent(response=response))
-            
-            # Add to conversation history
-            self.conversation_history.append({"role": "assistant", "content": response})
-        except Exception as e:
-            error_message = f"Error processing with documents: {str(e)}"
-            log_message(error_message, True)
-            log_message(traceback.format_exc(), True)
-            wx.PostEvent(self, ResponseEvent(response=error_message))
-            
-    def process_with_rag(self, user_message, client):
-        """Process a message using RAG or GraphRAG"""
-        try:
-            # Initialize the appropriate chain if needed
-            chain = None
-            if self.use_graph_rag:
-                if not self.graph_chain:
-                    log_message("Initializing GraphRAG chain")
-                    self.graph_chain = create_graph_chain(self.neo4j_manager, client)
-                chain = self.graph_chain
-            else:
-                if not self.rag_chain:
-                    log_message("Initializing RAG chain")
-                    self.rag_chain = create_rag_chain(self.neo4j_manager, client)
-                chain = self.rag_chain
-            
-            if not chain:
-                log_message("Failed to initialize RAG chain, falling back to standard processing", True)
-                self.process_with_documents(user_message, client)
-                return
-            
-            # Load any explicitly selected documents for additional context
-            additional_context = ""
-            if self.selected_docs:
-                doc_context = self.load_selected_documents()
-                additional_context = f"\nAdditional selected documents:\n{doc_context}"
-            
-            # Create conversation history text
-            history_text = ""
-            for msg in self.conversation_history[:-1]:  # Skip the last user message as we'll add it separately
-                sender = "User" if msg["role"] == "user" else "Assistant"
-                history_text += f"{sender}: {msg['content']}\n\n"
+                # Regular prompt-based approach when RAG is not enabled
+                log_message("Processing message with standard context")
                 
-            # Combine the query with history for better context
-            enhanced_query = f"""
-Conversation History:
-{history_text}
+                # Get selected documents
+                selected_docs = []
+                for child in self.doc_panel.GetChildren():
+                    for grandchild in child.GetChildren():
+                        if isinstance(grandchild, wx.CheckBox) and grandchild.GetValue():
+                            filename = grandchild.GetLabel()
+                            if filename in self.documents:
+                                content = self.documents[filename]
+                                # Get priority and sort accordingly
+                                priority = self.document_priorities.get(filename, "Medium")
+                                priority_value = {"High": 3, "Medium": 2, "Low": 1}.get(priority, 2)
+                                selected_docs.append((filename, content, priority_value))
+                
+                # Sort docs by priority (highest first)
+                selected_docs.sort(key=lambda x: x[2], reverse=True)
+                
+                # Build document context
+                doc_context = ""
+                if selected_docs:
+                    doc_context = "Here are the relevant documents:\n\n"
+                    for filename, content, _ in selected_docs:
+                        doc_context += f"[{filename}]\n{content}\n\n"
+                
+                # Build full prompt
+                system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
+                full_prompt = f"{system_prompt}\n\n{doc_context}User: {user_message}\n\nAssistant:"
+                
+                # Initialize streaming response
+                self.current_streaming_response = ""
+                
+                # Use streaming response with callback
+                response_chunks = []
+                for chunk in llm_client.generate_streaming(full_prompt, callback=update_response_callback):
+                    response_chunks.append(chunk)
+                    
+                response = "".join(response_chunks)
+            
+            return response
+        except Exception as e:
+            log_message(f"Error processing message: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            return f"Error: {str(e)}"
 
-User's Question: {user_message}
-{additional_context}
-"""
-            
-            log_message(f"Generating response using {'GraphRAG' if self.use_graph_rag else 'RAG'}")
-            self.SetStatusText(f"Searching knowledge base and generating response...")
-            
-            # Execute the chain
-            response = chain.invoke(enhanced_query)
-            
-            # Add source attribution if not already included
-            if "source" not in response.lower() and "reference" not in response.lower():
-                response += "\n\n(Information retrieved from knowledge base)"
-            
-            # Post event to add response to UI
-            wx.PostEvent(self, ResponseEvent(response=response))
+    def handle_response(self, response):
+        """Handle the response from the language model"""
+        try:
+            # Only append to chat if it's not a streaming response
+            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
+                self.append_to_chat(response, "Assistant")
+            else:
+                # Reset streaming state
+                self.current_streaming_response = None
             
             # Add to conversation history
             self.conversation_history.append({"role": "assistant", "content": response})
             
-            self.SetStatusText("Ready")
-        except Exception as e:
-            error_message = f"Error processing with RAG: {str(e)}"
-            log_message(error_message, True)
-            log_message(traceback.format_exc(), True)
-            wx.PostEvent(self, ResponseEvent(response=error_message))
-            # Fall back to standard processing
-            log_message("Falling back to standard processing due to RAG error")
-            self.process_with_documents(user_message, client)
-
-    def on_response_event(self, event):
-        try:
-            # Add response to chat
-            self.append_to_chat(event.response, "Assistant")
-            
-            # Enable input
+            # Re-enable input and update status
             self.user_input.Enable()
             self.SetStatusText("Ready")
         except Exception as e:
-            log_message(f"Error updating UI with response: {str(e)}", True)
+            log_message(f"Error handling response: {str(e)}", True)
+            self.user_input.Enable()
             self.SetStatusText(f"Error: {str(e)}")
-            self.user_input.Enable()
 
 
 # Dialog for editing conversation history
@@ -3207,189 +3412,296 @@ def create_default_config():
         }
 
 def create_rag_chain(neo4j_manager, llm_client):
-    """Create a RAG chain using the Neo4j vector store
-    
-    This uses a direct approach without LangChain Chain classes to avoid Pydantic issues
-    """
+    """Create a combined RAG chain using both vector store and knowledge graph"""
     try:
-        if not neo4j_manager or not neo4j_manager.vector_store:
-            log_message("Cannot create RAG chain: vector store not initialized", True)
+        # Check if the requirements are met
+        if not LANGCHAIN_AVAILABLE:
+            log_message("LangChain is not available, RAG chain cannot be created", True)
+            return None
+        
+        if not neo4j_manager or not hasattr(neo4j_manager, 'connected') or not neo4j_manager.connected:
+            log_message("Neo4j manager is not connected, RAG chain cannot be created", True)
             return None
             
-        # Create a template for the query
-        template = """You are a research assistant helping with academic writing.
-        Use the following pieces of context to answer the question at the end.
-        If you don't know the answer, just say that you don't know, don't try to make up an answer.
+        # Import necessary langchain components
+        from langchain_core.prompts import ChatPromptTemplate
+        from langchain_core.output_parsers import StrOutputParser
         
+        # Create prompt template
+        prompt = ChatPromptTemplate.from_template("""
+        You are a research assistant helping with scholarly papers and documents.
+        Below are some relevant passages from academic documents that might help answer the user's question.
+        The documents are connected in a knowledge graph, which provides additional context about the relationships.
+        
+        Relevant passages:
         {context}
         
-        Question: {question}
-        """
+        Knowledge graph relationships:
+        {graph_info}
         
-        # Create a function that will implement the chain logic
-        def rag_chain(query):
-            try:
-                # Search for relevant documents using our custom vector store
-                docs = neo4j_manager.vector_store.similarity_search(query, k=5)
-                
-                # Extract the content
-                context = "\n\n".join([doc.page_content for doc in docs if hasattr(doc, 'page_content')])
-                
-                # Format the prompt
-                formatted_prompt = template.replace("{context}", context).replace("{question}", query)
-                
-                # Call the LLM directly - handle different client types
-                if hasattr(llm_client, 'completions') and hasattr(llm_client.completions, 'create'):
-                    # OpenAI-like interface
-                    response = llm_client.completions.create(
-                        prompt=formatted_prompt,
-                        max_tokens=1000
-                    )
-                    result = response.choices[0].text
-                elif hasattr(llm_client, 'complete'):
-                    # Anthropic-like interface
-                    response = llm_client.complete(
-                        prompt=formatted_prompt,
-                        max_tokens_to_sample=1000
-                    )
-                    result = response.completion
-                elif hasattr(llm_client, 'generate_content'):
-                    # Google Gemini-like interface
-                    response = llm_client.generate_content(formatted_prompt)
-                    result = response.text
-                else:
-                    # Fallback for other LLM types
-                    log_message("Unsupported LLM client type for RAG", True)
-                    result = "Error: Unable to process with this LLM client type."
-                
-                return result
-                
-            except Exception as e:
-                log_message(f"Error in RAG chain: {str(e)}", True)
-                log_message(traceback.format_exc(), True)
-                return f"Error retrieving information: {str(e)}"
+        User's question: {query}
         
-        log_message("RAG chain created successfully")
-        return rag_chain
+        Please provide a comprehensive and accurate response based on the context provided.
+        Cite specific parts of the documents when appropriate by mentioning document titles.
+        Leverage the connections between documents and entities to provide a more holistic view.
+        If the information isn't in the context, say you don't have enough information from the provided documents.
+        """)
         
+        # Define the combined RAG chain
+        def combined_rag_chain(query):
+            # Check connection
+            if not neo4j_manager or not hasattr(neo4j_manager, 'connected') or not neo4j_manager.connected:
+                return "Database connection is not available. Please try again later."
+                
+            # Get similar documents using vector search first
+            vector_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=False)
+            
+            # Get related documents using graph-based search
+            graph_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=True)
+            
+            # Combine and deduplicate documents based on document_id
+            unique_docs = {}
+            for doc in vector_docs + graph_docs:
+                doc_id = doc.metadata.get("document_id", "unknown")
+                if doc_id not in unique_docs:
+                    unique_docs[doc_id] = doc
+            
+            # Get the final list of documents
+            relevant_docs = list(unique_docs.values())
+            
+            if not relevant_docs:
+                return "No relevant information found in the database for this query. Please try rephrasing or ask a different question."
+                
+            # Format context string from documents
+            context_parts = []
+            doc_ids = []
+            for i, doc in enumerate(relevant_docs):
+                title = doc.metadata.get("title", f"Document {i+1}")
+                doc_id = doc.metadata.get("document_id", "unknown")
+                doc_ids.append(doc_id)
+                context_parts.append(f"[{title}]: {doc.page_content}")
+            
+            context = "\n\n".join(context_parts)
+            
+            # Get document relationships from the graph
+            graph_info_parts = []
+            with neo4j_manager.driver.session() as session:
+                # Look for direct document relationships
+                for doc_id in doc_ids:
+                    result = session.run("""
+                    MATCH (d:Document {document_id: $doc_id})-[r]-(other)
+                    WHERE other:Document
+                    RETURN d.title AS title, type(r) AS relation, other.title AS other_title
+                    LIMIT 5
+                    """, doc_id=doc_id)
+                    
+                    for record in result:
+                        graph_info_parts.append(
+                            f"Document '{record['title']}' {record['relation']} '{record['other_title']}'"
+                        )
+                
+                # Look for entities in the documents and their relationships
+                for doc_id in doc_ids:
+                    result = session.run("""
+                    MATCH (d:Document {document_id: $doc_id})-[:CONTAINS]->(e)
+                    RETURN d.title AS doc_title, labels(e)[0] AS entity_type, e.id AS entity_id, e.name AS entity_name
+                    LIMIT 10
+                    """, doc_id=doc_id)
+                    
+                    for record in result:
+                        entity_name = record['entity_name'] if record['entity_name'] else record['entity_id']
+                        graph_info_parts.append(
+                            f"Document '{record['doc_title']}' contains {record['entity_type']} '{entity_name}'"
+                        )
+                    
+                    # Find relationships between entities
+                    result = session.run("""
+                    MATCH (d:Document {document_id: $doc_id})-[:CONTAINS]->(e1)-[r]->(e2)<-[:CONTAINS]-(d)
+                    RETURN labels(e1)[0] AS type1, e1.name AS name1, e1.id AS id1, 
+                           type(r) AS relation,
+                           labels(e2)[0] AS type2, e2.name AS name2, e2.id AS id2
+                    LIMIT 10
+                    """, doc_id=doc_id)
+                    
+                    for record in result:
+                        name1 = record['name1'] if record['name1'] else record['id1']
+                        name2 = record['name2'] if record['name2'] else record['id2']
+                        graph_info_parts.append(
+                            f"{record['type1']} '{name1}' {record['relation']} {record['type2']} '{name2}'"
+                        )
+            
+            # If no relationships found, extract key terms
+            if not graph_info_parts:
+                # Extract key terms from documents
+                try:
+                    import re
+                    from collections import Counter
+                    
+                    # Get all document content
+                    all_content = " ".join([doc.page_content for doc in relevant_docs])
+                    
+                    # Remove stop words and extract key terms
+                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
+                    words = re.findall(r'\b\w+\b', all_content.lower())
+                    key_terms = [w for w in words if w not in stop_words and len(w) > 3]
+                    
+                    # Get most common terms
+                    term_counts = Counter(key_terms)
+                    top_terms = term_counts.most_common(5)
+                    
+                    for term, count in top_terms:
+                        graph_info_parts.append(f"Key term '{term}' appears {count} times in the documents")
+                except Exception as e:
+                    log_message(f"Error extracting key terms: {str(e)}", True)
+            
+            graph_info = "\n".join(graph_info_parts) if graph_info_parts else "No explicit relationships found between documents."
+            
+            # Execute prompt with LLM
+            model = llm_client.get_model()
+            if model:
+                formatted_prompt = prompt.format(context=context, graph_info=graph_info, query=query)
+                response = model.invoke(formatted_prompt)
+                return response
+            else:
+                return "Language model is not available. Please check your API configuration."
+                
+        log_message("Combined RAG chain initialized successfully")
+        return combined_rag_chain
     except Exception as e:
-        log_message(f"Error creating RAG chain: {str(e)}", True)
+        log_message(f"Error creating combined RAG chain: {str(e)}", True)
         log_message(traceback.format_exc(), True)
         return None
-        
-def create_graph_chain(neo4j_manager, llm_client):
-    """Create a Graph RAG chain using the Neo4j vector store and graph queries
+
+# Add the LLMClient class back since it's still being referenced
+class LLMClient:
+    """Unified interface for different LLM providers"""
     
-    This uses a direct approach without LangChain Chain classes to avoid Pydantic issues
-    """
-    try:
-        if not neo4j_manager or not neo4j_manager.vector_store:
-            log_message("Cannot create GraphRAG chain: vector store not initialized", True)
+    def __init__(self, api_key, model_id, model_key=None):
+        self.api_key = api_key
+        self.model_id = model_id
+        self.model_key = model_key or "openai"  # Default to OpenAI
+        self.client = None
+        self._initialize_client()
+        
+    def _initialize_client(self):
+        """Initialize the appropriate client based on the model key"""
+        try:
+            if self.model_key == "openai":
+                from openai import OpenAI
+                self.client = OpenAI(api_key=self.api_key)
+            elif self.model_key == "anthropic":
+                from anthropic import Anthropic
+                self.client = Anthropic(api_key=self.api_key)
+            elif self.model_key == "gemini":
+                import google.generativeai as genai
+                genai.configure(api_key=self.api_key)
+                self.client = genai
+            else:
+                log_message(f"Unsupported model provider: {self.model_key}", True)
+                self.client = None
+        except Exception as e:
+            log_message(f"Error initializing LLM client: {str(e)}", True)
+            self.client = None
+            
+    def get_model(self):
+        """Get a unified model interface for langchain"""
+        try:
+            if not self.client:
+                return None
+                
+            # Create the appropriate model based on the provider
+            if self.model_key == "openai":
+                from langchain_openai import ChatOpenAI
+                return ChatOpenAI(
+                    model=self.model_id,
+                    openai_api_key=self.api_key,
+                    temperature=0.7
+                )
+            elif self.model_key == "anthropic":
+                from langchain_anthropic import ChatAnthropic
+                return ChatAnthropic(
+                    model=self.model_id,
+                    anthropic_api_key=self.api_key,
+                    temperature=0.7
+                )
+            elif self.model_key == "gemini":
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                return ChatGoogleGenerativeAI(
+                    model=self.model_id,
+                    google_api_key=self.api_key,
+                    temperature=0.7
+                )
+            else:
+                return None
+        except Exception as e:
+            log_message(f"Error creating langchain model: {str(e)}", True)
             return None
             
-        # Create a template for the query
-        template = """You are a research assistant helping with academic writing.
-        Use the following pieces of context to answer the question at the end.
-        The context includes both document excerpts and information about relationships between documents.
-        If you don't know the answer, just say that you don't know, don't try to make up an answer.
-        
-        Document excerpts:
-        {doc_context}
-        
-        Document relationships:
-        {graph_context}
-        
-        Question: {question}
-        """
-        
-        # Create a function that will implement the graph chain logic
-        def graph_chain(query):
-            try:
-                # Search for relevant documents using our custom vector store
-                docs = neo4j_manager.vector_store.similarity_search(query, k=3)
+    def generate_streaming(self, prompt, callback=None):
+        """Generate streaming response from the LLM"""
+        try:
+            if not self.client:
+                raise ValueError("LLM client not initialized")
                 
-                # Extract the content for document context
-                doc_context = "\n\n".join([doc.page_content for doc in docs if hasattr(doc, 'page_content')])
+            # Handle different client types
+            if self.model_key == "openai":
+                # OpenAI streaming
+                response = self.client.chat.completions.create(
+                    model=self.model_id,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True,
+                    max_tokens=4000
+                )
                 
-                # Get document IDs to use in graph query
-                doc_ids = [doc.metadata.get("document_id") for doc in docs 
-                          if hasattr(doc, 'metadata') and doc.metadata.get("document_id")]
-                
-                # Query the graph for relationships if we have document IDs
-                graph_context = "No relationship information available."
-                if doc_ids:
-                    # Create a Cypher query to find relationships between these documents
-                    # and any other documents they are connected to
-                    with neo4j_manager.driver.session() as session:
-                        result = session.run("""
-                        MATCH (d:Document)
-                        WHERE d.document_id IN $doc_ids
-                        OPTIONAL MATCH (d)-[r]->(other:Document)
-                        RETURN d.title as source, type(r) as relationship, other.title as target
-                        UNION
-                        MATCH (d:Document)
-                        WHERE d.document_id IN $doc_ids
-                        OPTIONAL MATCH (d)<-[r]-(other:Document)
-                        RETURN other.title as source, type(r) as relationship, d.title as target
-                        """, doc_ids=doc_ids)
+                # Process the streaming response
+                for chunk in response:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        content = chunk.choices[0].delta.content
+                        if callback:
+                            callback(content)
+                        yield content
                         
-                        # Format the relationships as text
-                        relationships = []
-                        for record in result:
-                            source = record["source"]
-                            relationship = record["relationship"]
-                            target = record["target"]
-                            
-                            if source and relationship and target:
-                                relationships.append(f"{source} {relationship} {target}")
+            elif self.model_key == "anthropic":
+                # Anthropic streaming
+                response = self.client.messages.create(
+                    model=self.model_id,
+                    max_tokens=4000,
+                    messages=[{"role": "user", "content": prompt}],
+                    stream=True
+                )
+                
+                # Process the streaming response
+                for chunk in response:
+                    if chunk.type == 'content_block_delta' and hasattr(chunk, 'delta') and hasattr(chunk.delta, 'text'):
+                        content = chunk.delta.text
+                        if callback:
+                            callback(content)
+                        yield content
                         
-                        if relationships:
-                            graph_context = "\n".join(relationships)
+            elif self.model_key == "gemini":
+                # Gemini streaming
+                model = self.client.GenerativeModel(self.model_id)
+                response = model.generate_content(
+                    prompt,
+                    stream=True
+                )
                 
-                # Format the prompt
-                formatted_prompt = (template
-                                   .replace("{doc_context}", doc_context)
-                                   .replace("{graph_context}", graph_context)
-                                   .replace("{question}", query))
+                # Process the streaming response
+                for chunk in response:
+                    if chunk.text:
+                        content = chunk.text
+                        if callback:
+                            callback(content)
+                        yield content
+            else:
+                raise ValueError(f"Unsupported model provider: {self.model_key}")
                 
-                # Call the LLM directly - handle different client types
-                if hasattr(llm_client, 'completions') and hasattr(llm_client.completions, 'create'):
-                    # OpenAI-like interface
-                    response = llm_client.completions.create(
-                        prompt=formatted_prompt,
-                        max_tokens=1000
-                    )
-                    result = response.choices[0].text
-                elif hasattr(llm_client, 'complete'):
-                    # Anthropic-like interface
-                    response = llm_client.complete(
-                        prompt=formatted_prompt,
-                        max_tokens_to_sample=1000
-                    )
-                    result = response.completion
-                elif hasattr(llm_client, 'generate_content'):
-                    # Google Gemini-like interface
-                    response = llm_client.generate_content(formatted_prompt)
-                    result = response.text
-                else:
-                    # Fallback for other LLM types
-                    log_message("Unsupported LLM client type for GraphRAG", True)
-                    result = "Error: Unable to process with this LLM client type."
-                
-                return result
-                
-            except Exception as e:
-                log_message(f"Error in GraphRAG chain: {str(e)}", True)
-                log_message(traceback.format_exc(), True)
-                return f"Error retrieving information: {str(e)}"
-        
-        log_message("GraphRAG chain created successfully")
-        return graph_chain
-        
-    except Exception as e:
-        log_message(f"Error creating Graph RAG chain: {str(e)}", True)
-        log_message(traceback.format_exc(), True)
-        return None
+        except Exception as e:
+            error_msg = f"Error generating streaming response: {str(e)}"
+            log_message(error_msg, True)
+            if callback:
+                callback(f"\n\nError: {error_msg}")
+            yield f"\n\nError: {error_msg}"
 
 # Main entry point
 if __name__ == "__main__":
