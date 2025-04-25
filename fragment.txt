@@ -1,0 +1,36 @@
+        
+    except Exception as e:
+        log_message(f"Error creating Graph RAG chain: {str(e)}", True)
+        log_message(traceback.format_exc(), True)
+        return None
+
+    def on_db_init_event(self, event):
+        """Handle database initialization event"""
+        try:
+            success = event.success
+            message = event.message
+            
+            if success:
+                log_message(f"Database initialization successful: {message}")
+                # Update UI to reflect success
+                wx.CallAfter(lambda: self.db_status.SetLabel("Database: Ready"))
+                # Enable RAG toggle
+                wx.CallAfter(lambda: self.rag_toggle.Enable(True))
+                # Initialize RAG chains
+                threading.Thread(target=self.initialize_rag_chains, daemon=True).start()
+            else:
+                log_message(f"Database initialization failed: {message}", True)
+                # Update UI to reflect failure but allow app to continue
+                wx.CallAfter(lambda: self.db_status.SetLabel(f"Database: Failed"))
+                wx.CallAfter(lambda: self.rag_toggle.Enable(False))
+                wx.CallAfter(lambda: self.rag_toggle.SetValue(False))
+                # Show a warning to the user but allow them to continue using basic functionality
+                wx.CallAfter(lambda: wx.MessageBox(
+                    f"Neo4j database initialization failed: {message}\n\n"
+                    "You can still use basic document functionality but RAG/GraphRAG features will be disabled.",
+                    "Database Warning",
+                    wx.OK | wx.ICON_WARNING
+                ))
+        except Exception as e:
+            log_message(f"Error handling database initialization event: {str(e)}", True)
+            log_message(traceback.format_exc(), True)

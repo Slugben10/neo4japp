@@ -1,0 +1,33 @@
+# Neo4j Research Assistant Dependencies
+
+# Core dependencies
+wxPython==4.2.3
+neo4j>=5.28.1,<6.0.0
+requests>=2.32.3
+
+# LLM APIs
+openai>=1.76.0
+tiktoken>=0.9.0
+
+# Document Processing
+pypdf>=5.4.0
+python-docx>=1.1.2
+
+# LangChain Components
+langchain>=0.3.24
+langchain_core>=0.3.55
+langchain_openai>=0.3.14
+langchain-neo4j>=0.4.0
+langchain-community>=0.3.22
+langchain-text-splitters>=0.3.8
+
+# Neo4j Graph Data Science
+graphdatascience>=1.14
+pandas>=2.2.3
+numpy>=2.0.2
+
+# Optional: Anthropic API support
+# anthropic>=1.0.0
+
+# Optional: Google AI support
+# google-generativeai>=0.5.0

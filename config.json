@@ -1,0 +1,37 @@
+{
+    "models": {
+      "openai": {
+        "name": "OpenAI GPT-4o-mini",
+        "api_key_env": "OPENAI_API_KEY",
+        "model_name": "gpt-4o-mini"
+      },
+      "anthropic": {
+        "name": "Anthropic Claude",
+        "api_key_env": "ANTHROPIC_API_KEY",
+        "model_name": "claude-3-7-sonnet-20250219"
+      },
+      "llama": {
+        "name": "Meta LLaMA",
+        "model_path": "models/llama",
+        "model_name": "llama-7b"
+      },
+      "gemini": {
+        "name": "Google Gemini-2.0-Flash",
+        "api_key_env": "GOOGLE_API_KEY",
+        "model_name": "gemini-2.0-flash"
+      },
+      "qwen": {
+        "name": "Qwen",
+        "api_key_env": "QWEN_API_KEY",
+        "model_name": "qwen-14b"
+      },
+      "deepseek": {
+        "name": "DeepSeek",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "model_name": "deepseek-coder"
+      }
+    },
+    "default_model": "openai",
+    "max_tokens": 8000,
+    "system_prompt": "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions."
+  }
