@@ -18,6 +18,7 @@ import tarfile
 import atexit
 import re
 import select
+import importlib
 # Conditionally import fcntl as it's only available on Unix-like systems
 try:
     import fcntl
@@ -473,8 +474,13 @@ class Neo4jDatabaseManager:
                     # Continue even if vector store addition fails - we still have the graph data
             
             # STEP 3: Add to knowledge graph
-            graph_success = self.add_document_to_knowledge_graph(document_id, title, content, safe_metadata)
+            try:
+                graph_success = self.add_document_to_knowledge_graph(document_id, title, content, safe_metadata)
+            except Exception as e:
+                log_message(f"Error in knowledge graph processing: {str(e)}", True)
+                graph_success = False
             
+            # Return true if either component succeeded
             if vector_store_success or graph_success:
                 log_message(f"Added document {document_id} to database")
                 return True
@@ -632,7 +638,16 @@ class Neo4jDatabaseManager:
                         """, limit=limit)
                     
                     # Process results
-                    from langchain_core.documents import Document
+                    try:
+                        from langchain_core.documents import Document
+                    except ImportError:
+                        log_message("langchain_core.documents not available, using custom Document class", True)
+                        # Define a simple Document class to mimic LangChain's Document
+                        class Document:
+                            def __init__(self, page_content, metadata=None):
+                                self.page_content = page_content
+                                self.metadata = metadata or {}
+                    
                     documents = []
                     
                     for record in result:
@@ -664,7 +679,16 @@ class Neo4jDatabaseManager:
                     """, query=query, limit=limit)
                     
                     # Process results
-                    from langchain_core.documents import Document
+                    try:
+                        from langchain_core.documents import Document
+                    except ImportError:
+                        log_message("langchain_core.documents not available, using custom Document class", True)
+                        # Define a simple Document class to mimic LangChain's Document
+                        class Document:
+                            def __init__(self, page_content, metadata=None):
+                                self.page_content = page_content
+                                self.metadata = metadata or {}
+                    
                     documents = []
                     
                     for record in result:
@@ -736,15 +760,44 @@ class Neo4jDatabaseManager:
                 return False
                 
             # Import required libraries
-            try:
-                from langchain_core.documents import Document
-                from langchain.text_splitter import RecursiveCharacterTextSplitter
-                from langchain_experimental.graph_transformers import LLMGraphTransformer
-                from langchain_openai import ChatOpenAI
-            except ImportError:
-                log_message("Required libraries for knowledge graph not available", True)
+            required_libs = [
+                "langchain_core.documents",
+                "langchain.text_splitter",
+                "langchain_experimental.graph_transformers",
+                "langchain_openai"
+            ]
+            
+            missing_libs = []
+            imported_modules = {}
+            
+            # Check each required library
+            for lib in required_libs:
+                try:
+                    module_name = lib.split(".")[-1]
+                    imported_modules[module_name] = importlib.import_module(lib)
+                except ImportError as e:
+                    missing_libs.append(f"{lib}: {str(e)}")
+            
+            if missing_libs:
+                log_message(f"Some required libraries for knowledge graph are missing: {', '.join(missing_libs)}", True)
+                log_message("Knowledge graph features will be limited. Document will still be available for vector search.", True)
+                # We'll still create the base document node so it can be found by vector search
+                with self.driver.session() as session:
+                    session.run("""
+                    MERGE (d:Document {document_id: $doc_id})
+                    SET d.title = $title,
+                        d.content = $content,
+                        d.updated_at = datetime()
+                    """, doc_id=document_id, title=title, content=content)
+                    log_message("Created placeholder document node")
                 return False
                 
+            # We have all required libs - extract the imported modules
+            Document = imported_modules.get("documents").Document
+            RecursiveCharacterTextSplitter = imported_modules.get("text_splitter").RecursiveCharacterTextSplitter
+            LLMGraphTransformer = imported_modules.get("graph_transformers").LLMGraphTransformer
+            ChatOpenAI = imported_modules.get("langchain_openai").ChatOpenAI
+            
             # Use LLM to extract entities and relationships
             # First, split document into manageable chunks
             text_splitter = RecursiveCharacterTextSplitter(
@@ -766,89 +819,150 @@ class Neo4jDatabaseManager:
             # Initialize LLM and graph transformer
             llm = None
             try:
-                llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-            except:
+                api_key = os.environ.get("OPENAI_API_KEY")
+                if api_key:
+                    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
+                    log_message("Using OpenAI for knowledge graph extraction")
+                else:
+                    log_message("OpenAI API key not found", True)
+                    raise ValueError("OpenAI API key not available")
+            except Exception as e:
+                log_message(f"Error initializing OpenAI LLM: {str(e)}", True)
                 try:
                     from langchain_community.chat_models import ChatOllama
                     llm = ChatOllama(model="llama3", temperature=0)
-                except:
-                    log_message("No LLM available for graph transformation", True)
+                    log_message("Using Ollama for knowledge graph extraction")
+                except Exception as ollama_err:
+                    log_message(f"Error initializing Ollama LLM: {str(ollama_err)}", True)
+                    log_message("No suitable LLM available for graph transformation", True)
+                    # Still create the document node at minimum
+                    with self.driver.session() as session:
+                        session.run("""
+                        MERGE (d:Document {document_id: $doc_id})
+                        SET d.title = $title,
+                            d.content = $content,
+                            d.updated_at = datetime()
+                        """, doc_id=document_id, title=title, content=content)
+                        log_message("Created placeholder document node")
                     return False
             
             # Create graph transformer and convert documents
             if llm:
-                llm_transformer = LLMGraphTransformer(llm=llm)
-                
-                # Convert documents to graph format
-                graph_documents = llm_transformer.convert_to_graph_documents(chunks)
-                
-                # Add to graph database with base entity label
+                try:
+                    llm_transformer = LLMGraphTransformer(llm=llm)
+                    
+                    # Convert documents to graph format
+                    graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+                    
+                    # Add to graph database with base entity label
+                    with self.driver.session() as session:
+                        # First, create the base document node to connect everything
+                        session.run("""
+                        MERGE (d:Document {document_id: $doc_id})
+                        SET d.title = $title,
+                            d.content = $content,
+                            d.updated_at = datetime()
+                        """, doc_id=document_id, title=title, content=content)
+                        
+                        # Process graph documents to create entity nodes and relationships
+                        for graph_doc in graph_documents:
+                            # Check if the graph document has entities
+                            if hasattr(graph_doc, 'entities') and graph_doc.entities:
+                                # Add entities
+                                for entity in graph_doc.entities:
+                                    # Create entity node
+                                    entity_id = entity.id
+                                    entity_type = entity.entity_type
+                                    entity_properties = {}
+                                    
+                                    # Extract safe properties
+                                    for k, v in entity.properties.items():
+                                        if isinstance(v, (str, int, float, bool)):
+                                            entity_properties[k] = v
+                                    
+                                    # Build the query dynamically
+                                    query = f"""
+                                    MERGE (e:`{entity_type}` {{id: $id}})
+                                    """
+                                    
+                                    # Add SET clause if there are properties
+                                    if entity_properties:
+                                        query += "SET " + ", ".join([f"e.{k} = ${k}" for k in entity_properties.keys()])
+                                    
+                                    # Execute query
+                                    params = {"id": entity_id}
+                                    params.update(entity_properties)
+                                    session.run(query, **params)
+                                    
+                                    # Connect entity to document
+                                    session.run("""
+                                    MATCH (d:Document {document_id: $doc_id})
+                                    MATCH (e {id: $entity_id})
+                                    MERGE (d)-[:CONTAINS]->(e)
+                                    """, doc_id=document_id, entity_id=entity_id)
+                            
+                            # Check if the graph document has relationships
+                            if hasattr(graph_doc, 'relationships') and graph_doc.relationships:
+                                # Add relationships between entities
+                                for rel in graph_doc.relationships:
+                                    # Extract source and target IDs from Node objects
+                                    source_id = rel.source.id if hasattr(rel.source, 'id') else str(rel.source)
+                                    target_id = rel.target.id if hasattr(rel.target, 'id') else str(rel.target)
+                                    rel_type = rel.type
+                                    
+                                    # Create relationship
+                                    session.run(f"""
+                                    MATCH (source {{id: $source_id}})
+                                    MATCH (target {{id: $target_id}})
+                                    MERGE (source)-[:`{rel_type}`]->(target)
+                                    """, source_id=source_id, target_id=target_id)
+                            else:
+                                # Handle the case when graph document doesn't have expected structure
+                                log_message(f"Graph document is missing expected structure. Creating only basic document node.")
+                    
+                    log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
+                    return True
+                except Exception as transform_err:
+                    log_message(f"Error in graph transformation process: {str(transform_err)}", True)
+                    log_message(traceback.format_exc(), True)
+                    # Still create the document node at minimum
+                    with self.driver.session() as session:
+                        session.run("""
+                        MERGE (d:Document {document_id: $doc_id})
+                        SET d.title = $title,
+                            d.content = $content,
+                            d.updated_at = datetime()
+                        """, doc_id=document_id, title=title, content=content)
+                        log_message("Created placeholder document node")
+                    return False
+            else:
+                log_message("Could not initialize LLM for graph transformation", True)
+                # Still create the document node at minimum
                 with self.driver.session() as session:
-                    # First, create the base document node to connect everything
                     session.run("""
                     MERGE (d:Document {document_id: $doc_id})
                     SET d.title = $title,
                         d.content = $content,
                         d.updated_at = datetime()
                     """, doc_id=document_id, title=title, content=content)
-                    
-                    # Process graph documents to create entity nodes and relationships
-                    for graph_doc in graph_documents:
-                        # Add entities
-                        for entity in graph_doc.entities:
-                            # Create entity node
-                            entity_id = entity.id
-                            entity_type = entity.entity_type
-                            entity_properties = {}
-                            
-                            # Extract safe properties
-                            for k, v in entity.properties.items():
-                                if isinstance(v, (str, int, float, bool)):
-                                    entity_properties[k] = v
-                            
-                            # Build the query dynamically
-                            query = f"""
-                            MERGE (e:`{entity_type}` {{id: $id}})
-                            """
-                            
-                            # Add SET clause if there are properties
-                            if entity_properties:
-                                query += "SET " + ", ".join([f"e.{k} = ${k}" for k in entity_properties.keys()])
-                            
-                            # Execute query
-                            params = {"id": entity_id}
-                            params.update(entity_properties)
-                            session.run(query, **params)
-                            
-                            # Connect entity to document
-                            session.run("""
-                            MATCH (d:Document {document_id: $doc_id})
-                            MATCH (e {id: $entity_id})
-                            MERGE (d)-[:CONTAINS]->(e)
-                            """, doc_id=document_id, entity_id=entity_id)
-                        
-                        # Add relationships between entities
-                        for rel in graph_doc.relationships:
-                            source_id = rel.source
-                            target_id = rel.target
-                            rel_type = rel.relationship_type
-                            
-                            # Create relationship
-                            session.run(f"""
-                            MATCH (source {{id: $source_id}})
-                            MATCH (target {{id: $target_id}})
-                            MERGE (source)-[:`{rel_type}`]->(target)
-                            """, source_id=source_id, target_id=target_id)
-                
-                log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
-                return True
-            else:
-                log_message("Could not initialize LLM for graph transformation", True)
+                    log_message("Created placeholder document node")
                 return False
                 
         except Exception as e:
             log_message(f"Error adding document to knowledge graph: {str(e)}", True)
             log_message(traceback.format_exc(), True)
+            # Still try to create the document node at minimum
+            try:
+                with self.driver.session() as session:
+                    session.run("""
+                    MERGE (d:Document {document_id: $doc_id})
+                    SET d.title = $title,
+                        d.content = $content,
+                        d.updated_at = datetime()
+                    """, doc_id=document_id, title=title, content=content)
+                    log_message("Created placeholder document node despite error")
+            except:
+                pass
             return False
 
 # Override IsDisplayAvailable to always return True
@@ -2549,15 +2663,46 @@ class ResearchAssistantApp(wx.Frame):
                     # Use appropriate method to read file based on extension
                     if file_extension == '.pdf':
                         try:
+                            # Try loading with pypdf first
                             import pypdf
                             with open(dest_path, 'rb') as f:
                                 pdf_reader = pypdf.PdfReader(f)
                                 for page in pdf_reader.pages:
                                     content += page.extract_text() + "\n"
+                            
+                            # If content is too short, try alternate extraction methods
+                            if len(content.strip()) < 100:
+                                log_message(f"Limited text extracted from PDF {filename}, trying alternate methods")
+                                
+                                # Try alternative PDF extraction if available
+                                try:
+                                    # Try to import langchain PDF loader
+                                    from langchain_community.document_loaders import PyPDFLoader
+                                    pdf_doc = PyPDFLoader(dest_path).load()
+                                    content = ""
+                                    for page in pdf_doc:
+                                        content += page.page_content + "\n"
+                                    log_message(f"Used langchain PyPDFLoader for {filename}")
+                                except ImportError:
+                                    log_message(f"langchain PyPDFLoader not available", True)
                         except ImportError:
-                            # Fallback if pypdf is not installed
-                            with open(dest_path, 'rb') as f:
-                                content = f"[PDF content not extracted - pypdf module not available]\n\nFile: {filename}"
+                            # Try langchain if pypdf is not installed
+                            try:
+                                from langchain_community.document_loaders import PyPDFLoader
+                                pdf_doc = PyPDFLoader(dest_path).load()
+                                content = ""
+                                for page in pdf_doc:
+                                    content += page.page_content + "\n"
+                                log_message(f"Used langchain PyPDFLoader for {filename} (pypdf not available)")
+                            except ImportError:
+                                # Fallback if langchain is not installed
+                                with open(dest_path, 'rb') as f:
+                                    content = f"[PDF content not extracted - required modules not available]\n\nFile: {filename}"
+                        
+                        # If content is still very limited, warn the user
+                        if len(content.strip()) < 100:
+                            log_message(f"Warning: Limited text extracted from PDF {filename}. PDF may be scanned or have restricted permissions.", True)
+                            content += "\n[Note: Limited text could be extracted from this PDF. It may be a scanned document or have security restrictions.]"
                     elif file_extension == '.docx':
                         try:
                             import docx
@@ -2719,16 +2864,34 @@ class ResearchAssistantApp(wx.Frame):
                 progress_dlg.Update(i, f"Uploading {filename}...")
                 content = self.documents[filename]
                 
+                # Skip if content is empty or just a placeholder message
+                if not content or content.startswith("[PDF content not extracted"):
+                    log_message(f"Skipping '{filename}' - no content could be extracted", True)
+                    wx.MessageBox(
+                        f"Cannot upload '{filename}' because no content could be extracted from it.\n\nPlease try a different PDF reader software to extract the text first, then save it as a text file and upload that instead.",
+                        "Upload Error",
+                        wx.OK | wx.ICON_ERROR
+                    )
+                    continue
+                
                 # Create a unique document ID
                 import hashlib
                 doc_id = hashlib.md5(filename.encode()).hexdigest()
+                
+                # Add to database
+                log_message(f"Adding document {doc_id} to database: {filename}")
+                
+                # Get file extension to check if it's a PDF
+                file_extension = os.path.splitext(filename)[1].lower()
+                if file_extension == '.pdf':
+                    log_message(f"Processing PDF document: {filename}")
                 
                 # Add to vector store
                 success = self.neo4j_manager.add_document(
                     document_id=doc_id,
                     title=filename,
                     content=content,
-                    metadata={"filename": filename}
+                    metadata={"filename": filename, "file_type": file_extension[1:] if file_extension else "unknown"}
                 )
                 
                 if success:
@@ -3660,10 +3823,21 @@ def create_rag_chain(neo4j_manager, llm_client):
                 return "Database connection is not available. Please try again later."
                 
             # Get similar documents using vector search first
-            vector_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=False)
+            vector_docs = []
+            try:
+                vector_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=False)
+                log_message(f"Found {len(vector_docs)} similar documents using vector search")
+            except Exception as e:
+                log_message(f"Error in vector search: {str(e)}", True)
             
             # Get related documents using graph-based search
-            graph_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=True)
+            graph_docs = []
+            try:
+                graph_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=True)
+                log_message(f"Found {len(graph_docs)} similar documents using graph search")
+            except Exception as e:
+                log_message(f"Error in graph search: {str(e)}", True)
+                # Continue with just vector results if graph search fails
             
             # Combine and deduplicate documents based on document_id
             unique_docs = {}

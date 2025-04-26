@@ -23,9 +23,12 @@ required_packages = [
     "langchain>=0.0.240,<=0.0.312", 
     "langchain_core>=0.1.0", 
     "langchain_openai", 
-    "langchain-neo4j", 
-    "langchain-community", 
-    "openai"
+    "langchain_neo4j", 
+    "langchain_community", 
+    "langchain_experimental",
+    "openai",
+    "pypdf",  # PDF processing
+    "python-docx",  # DOCX processing
 ]
 missing_packages = []
 
@@ -214,6 +217,12 @@ hidden_imports = [
     "langchain_openai",
     "langchain_neo4j",
     "langchain_community.vectorstores",
+    "langchain_community.document_loaders",
+    "langchain_community.document_loaders.pdf",
+    "langchain_community.document_loaders.text",
+    "langchain_community.document_loaders.docx",
+    "langchain_experimental",
+    "langchain_experimental.graph_transformers",
 ]
 
 # Try to include optional packages
