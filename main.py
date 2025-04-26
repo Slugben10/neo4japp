@@ -2350,6 +2350,25 @@ class ResearchAssistantApp(wx.Frame):
             self.rag_toggle.Bind(wx.EVT_CHECKBOX, self.on_rag_toggle)
             rag_sizer.Add(self.rag_toggle, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
             
+            # Database actions panel
+            db_actions_panel = wx.Panel(rag_panel)
+            db_actions_sizer = wx.BoxSizer(wx.HORIZONTAL)
+            
+            # Upload to Database button
+            upload_to_db_btn = wx.Button(db_actions_panel, label="Upload to Database")
+            upload_to_db_btn.SetToolTip("Upload selected documents to database")
+            upload_to_db_btn.Bind(wx.EVT_BUTTON, self.on_upload_to_database)
+            db_actions_sizer.Add(upload_to_db_btn, 1, wx.RIGHT, 5)
+            
+            # Delete from Database button
+            delete_from_db_btn = wx.Button(db_actions_panel, label="Delete from Database")
+            delete_from_db_btn.SetToolTip("Delete selected documents from database")
+            delete_from_db_btn.Bind(wx.EVT_BUTTON, self.on_delete_from_database)
+            db_actions_sizer.Add(delete_from_db_btn, 1)
+            
+            db_actions_panel.SetSizer(db_actions_sizer)
+            rag_sizer.Add(db_actions_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+            
             # GraphRAG/RAG selection
             rag_type_panel = wx.Panel(rag_panel)
             rag_type_sizer = wx.BoxSizer(wx.HORIZONTAL)
@@ -2561,27 +2580,8 @@ class ResearchAssistantApp(wx.Frame):
                             except Exception as e:
                                 content = f"[Error reading file: {str(e)}]\n\nFile: {filename}"
                     
-                    # Add document to database if RAG is enabled and DB is initialized
-                    if hasattr(self, 'rag_toggle') and self.rag_toggle.GetValue() and self.db_initialized and self.neo4j_manager:
-                        try:
-                            # Create a unique document ID
-                            import hashlib
-                            doc_id = hashlib.md5(filename.encode()).hexdigest()
-                            
-                            # Add to vector store
-                            success = self.neo4j_manager.add_document(
-                                document_id=doc_id,
-                                title=filename,
-                                content=content,
-                                metadata={"filename": filename, "path": dest_path}
-                            )
-                            
-                            if success:
-                                log_message(f"Added document '{filename}' to vector store")
-                            else:
-                                log_message(f"Failed to add document '{filename}' to vector store", True)
-                        except Exception as e:
-                            log_message(f"Error adding document to vector store: {str(e)}", True)
+                    # Note: We're not automatically adding documents to the database anymore.
+                    # Users should select documents and click the "Upload to Database" button to add them.
                     
                     # Store document with default priority
                     self.documents[filename] = content
@@ -2674,6 +2674,182 @@ class ResearchAssistantApp(wx.Frame):
         except Exception as e:
             log_message(f"Error deleting document: {str(e)}", True)
             log_message(traceback.format_exc(), True)
+    
+    def on_upload_to_database(self, event):
+        """Upload selected documents to the database without deleting them first"""
+        try:
+            # Check if database is ready
+            if not self.db_initialized or not self.neo4j_manager:
+                wx.MessageBox(
+                    "Database is not initialized. Please make sure Neo4j is running and try again.",
+                    "Database Not Ready",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+            
+            # Get selected documents
+            selected_docs = []
+            for child in self.doc_panel.GetChildren():
+                for grandchild in child.GetChildren():
+                    if isinstance(grandchild, wx.CheckBox) and grandchild.GetValue():
+                        filename = grandchild.GetLabel()
+                        if filename in self.documents:
+                            selected_docs.append(filename)
+            
+            if not selected_docs:
+                wx.MessageBox(
+                    "No documents selected. Please select documents to upload to the database.",
+                    "No Selection",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+                return
+            
+            # Show progress dialog
+            progress_dlg = wx.ProgressDialog(
+                "Uploading Documents",
+                f"Uploading {len(selected_docs)} documents to database...",
+                maximum=len(selected_docs),
+                parent=self,
+                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE
+            )
+            
+            # Upload each selected document
+            successful = 0
+            for i, filename in enumerate(selected_docs):
+                progress_dlg.Update(i, f"Uploading {filename}...")
+                content = self.documents[filename]
+                
+                # Create a unique document ID
+                import hashlib
+                doc_id = hashlib.md5(filename.encode()).hexdigest()
+                
+                # Add to vector store
+                success = self.neo4j_manager.add_document(
+                    document_id=doc_id,
+                    title=filename,
+                    content=content,
+                    metadata={"filename": filename}
+                )
+                
+                if success:
+                    successful += 1
+                    log_message(f"Added document '{filename}' to database")
+                else:
+                    log_message(f"Failed to add document '{filename}' to database", True)
+            
+            progress_dlg.Destroy()
+            
+            # Show result message
+            if successful > 0:
+                wx.MessageBox(
+                    f"Successfully uploaded {successful} of {len(selected_docs)} documents to the database.",
+                    "Upload Complete",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+            else:
+                wx.MessageBox(
+                    "Failed to upload any documents to the database. Please check the logs for details.",
+                    "Upload Failed",
+                    wx.OK | wx.ICON_ERROR
+                )
+        except Exception as e:
+            log_message(f"Error uploading documents to database: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            wx.MessageBox(
+                f"Error uploading documents to database: {str(e)}",
+                "Upload Error",
+                wx.OK | wx.ICON_ERROR
+            )
+    
+    def on_delete_from_database(self, event):
+        """Delete selected documents from the database without removing them from the UI"""
+        try:
+            # Check if database is ready
+            if not self.db_initialized or not self.neo4j_manager:
+                wx.MessageBox(
+                    "Database is not initialized. Please make sure Neo4j is running and try again.",
+                    "Database Not Ready",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+            
+            # Get selected documents
+            selected_docs = []
+            for child in self.doc_panel.GetChildren():
+                for grandchild in child.GetChildren():
+                    if isinstance(grandchild, wx.CheckBox) and grandchild.GetValue():
+                        filename = grandchild.GetLabel()
+                        if filename in self.documents:
+                            selected_docs.append(filename)
+            
+            if not selected_docs:
+                wx.MessageBox(
+                    "No documents selected. Please select documents to delete from the database.",
+                    "No Selection",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+                return
+            
+            # Confirm deletion
+            dlg = wx.MessageDialog(
+                self, 
+                f"Are you sure you want to delete {len(selected_docs)} documents from the database? This will not remove them from your local documents list.",
+                "Confirm Database Deletion", 
+                wx.YES_NO | wx.ICON_QUESTION
+            )
+            result = dlg.ShowModal()
+            dlg.Destroy()
+            
+            if result != wx.ID_YES:
+                return
+            
+            # Show progress dialog
+            progress_dlg = wx.ProgressDialog(
+                "Deleting Documents",
+                f"Deleting {len(selected_docs)} documents from database...",
+                maximum=len(selected_docs),
+                parent=self,
+                style=wx.PD_APP_MODAL | wx.PD_AUTO_HIDE
+            )
+            
+            # Delete each selected document from the database
+            successful = 0
+            for i, filename in enumerate(selected_docs):
+                progress_dlg.Update(i, f"Deleting {filename}...")
+                
+                # Create a document ID consistent with upload
+                import hashlib
+                doc_id = hashlib.md5(filename.encode()).hexdigest()
+                
+                if self.neo4j_manager.remove_document(doc_id):
+                    successful += 1
+                    log_message(f"Removed document '{filename}' from database")
+                else:
+                    log_message(f"Failed to remove document '{filename}' from database", True)
+            
+            progress_dlg.Destroy()
+            
+            # Show result message
+            if successful > 0:
+                wx.MessageBox(
+                    f"Successfully deleted {successful} of {len(selected_docs)} documents from the database.",
+                    "Deletion Complete",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+            else:
+                wx.MessageBox(
+                    "Failed to delete any documents from the database. Please check the logs for details.",
+                    "Deletion Failed",
+                    wx.OK | wx.ICON_ERROR
+                )
+        except Exception as e:
+            log_message(f"Error deleting documents from database: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            wx.MessageBox(
+                f"Error deleting documents from database: {str(e)}",
+                "Deletion Error",
+                wx.OK | wx.ICON_ERROR
+            )
     
     def refresh_document_list(self):
         """Refresh the document list in the UI"""
@@ -3137,7 +3313,7 @@ class ResearchAssistantApp(wx.Frame):
                     
                     # Use streaming response with callback
                     system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
-                    full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant:"
+                    full_prompt = f"{system_prompt}\n\nUser: {user_message}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
                     
                     # Process streaming response
                     response_chunks = []
@@ -3174,7 +3350,7 @@ class ResearchAssistantApp(wx.Frame):
                 
                 # Build full prompt
                 system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
-                full_prompt = f"{system_prompt}\n\n{doc_context}User: {user_message}\n\nAssistant:"
+                full_prompt = f"{system_prompt}\n\n{doc_context}User: {user_message}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
                 
                 # Initialize streaming response
                 self.current_streaming_response = ""
@@ -3470,9 +3646,11 @@ def create_rag_chain(neo4j_manager, llm_client):
         User's question: {query}
         
         Please provide a comprehensive and accurate response based on the context provided.
+        Combine the information from the database with your own knowledge to give the most helpful answer.
+        Use your general knowledge to add context, explanations, or examples when relevant, but prioritize the information from the provided documents.
         Cite specific parts of the documents when appropriate by mentioning document titles.
         Leverage the connections between documents and entities to provide a more holistic view.
-        If the information isn't in the context, say you don't have enough information from the provided documents.
+        If the information isn't in the context, you can still try to answer based on your knowledge but make it clear what comes from the documents and what comes from your general knowledge.
         """)
         
         # Define the combined RAG chain
