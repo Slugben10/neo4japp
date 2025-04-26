@@ -558,7 +558,7 @@ class Neo4jDatabaseManager:
         """Query for similar text chunks using vector store or graph relationships
         
         Args:
-            query_text: The text to find similar documents to
+            query: The text to find similar documents to
             limit: Maximum number of results to return
             use_graph: If True, use graph relationships for search; otherwise use vector embedding
         """
@@ -591,7 +591,7 @@ class Neo4jDatabaseManager:
                     
                     # Remove stop words and extract key terms
                     stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
-                    words = re.findall(r'\b\w+\b', query_text.lower())
+                    words = re.findall(r'\b\w+\b', query.lower())
                     key_terms = [w for w in words if w not in stop_words and len(w) > 2]
                     
                     # Get most common terms
@@ -661,7 +661,7 @@ class Neo4jDatabaseManager:
                     WHERE d.document_id <> 'placeholder' AND toLower(d.content) CONTAINS toLower($query)
                     RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
                     LIMIT $limit
-                    """, query=query_text, limit=limit)
+                    """, query=query, limit=limit)
                     
                     # Process results
                     from langchain_core.documents import Document
@@ -3000,6 +3000,14 @@ class ResearchAssistantApp(wx.Frame):
     def append_to_chat(self, message, sender):
         """Append a message to the chat display"""
         try:
+            # Handle AIMessage objects from LangChain
+            if hasattr(message, 'content') and callable(getattr(message, 'content', None)):
+                # This is for older versions of langchain
+                message = message.content()
+            elif hasattr(message, 'content') and not callable(getattr(message, 'content', None)):
+                # This is for newer versions of langchain
+                message = message.content
+            
             # Get current text position for indexing/editing
             current_position = len(self.chat_display.GetValue())
             if current_position > 0 and not self.chat_display.GetValue().endswith("\n\n"):
@@ -3017,7 +3025,7 @@ class ResearchAssistantApp(wx.Frame):
             self.chat_display.SetStyle(current_position, end_pos, wx.TextAttr(wx.NullColour, wx.NullColour, wx.Font(wx.NORMAL_FONT.GetPointSize(), wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)))
             
             # Add the message text
-            self.chat_display.AppendText(message)
+            self.chat_display.AppendText(str(message))
             
             # Store the position of this message for editing purposes
             self.message_positions.append(current_position)
@@ -3030,6 +3038,14 @@ class ResearchAssistantApp(wx.Frame):
     def append_streaming_chunk(self, chunk):
         """Append a streaming chunk to the chat display"""
         try:
+            # Handle AIMessage objects from LangChain
+            if hasattr(chunk, 'content') and callable(getattr(chunk, 'content', None)):
+                # This is for older versions of langchain
+                chunk = chunk.content()
+            elif hasattr(chunk, 'content') and not callable(getattr(chunk, 'content', None)):
+                # This is for newer versions of langchain
+                chunk = chunk.content
+            
             # If this is the first chunk, add a new message
             if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
                 self.current_streaming_response = ""
@@ -3048,7 +3064,7 @@ class ResearchAssistantApp(wx.Frame):
                 self.message_positions.append(current_position)
             
             # Append the new chunk
-            self.chat_display.AppendText(chunk)
+            self.chat_display.AppendText(str(chunk))
             
             # Scroll to the bottom
             self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
@@ -3179,6 +3195,15 @@ class ResearchAssistantApp(wx.Frame):
     def handle_response(self, response):
         """Handle the response from the language model"""
         try:
+            # Handle AIMessage objects from LangChain
+            original_response = response
+            if hasattr(response, 'content') and callable(getattr(response, 'content', None)):
+                # This is for older versions of langchain
+                response = response.content()
+            elif hasattr(response, 'content') and not callable(getattr(response, 'content', None)):
+                # This is for newer versions of langchain
+                response = response.content
+                
             # Only append to chat if it's not a streaming response
             if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
                 self.append_to_chat(response, "Assistant")
@@ -3186,8 +3211,11 @@ class ResearchAssistantApp(wx.Frame):
                 # Reset streaming state
                 self.current_streaming_response = None
             
-            # Add to conversation history
-            self.conversation_history.append({"role": "assistant", "content": response})
+            # Add to conversation history - preserve the original structure if it was an AIMessage
+            if hasattr(original_response, 'content'):
+                self.conversation_history.append({"role": "assistant", "content": response})
+            else:
+                self.conversation_history.append({"role": "assistant", "content": original_response})
             
             # Re-enable input and update status
             self.user_input.Enable()
@@ -3561,6 +3589,13 @@ def create_rag_chain(neo4j_manager, llm_client):
             if model:
                 formatted_prompt = prompt.format(context=context, graph_info=graph_info, query=query)
                 response = model.invoke(formatted_prompt)
+                
+                # Convert AIMessage to string if needed
+                if hasattr(response, 'content'):
+                    if callable(getattr(response, 'content', None)):
+                        return response.content()
+                    else:
+                        return response.content
                 return response
             else:
                 return "Language model is not available. Please check your API configuration."
