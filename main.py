@@ -19,6 +19,72 @@ import atexit
 import re
 import select
 import importlib
+
+# Define a function to check if a package is installed
+def check_package_installed(package_name):
+    try:
+        importlib.import_module(package_name)
+        return True
+    except ImportError:
+        return False
+
+# Special function to ensure Google packages are installed correctly
+def ensure_google_packages():
+    """Ensure all required Google packages are installed with the correct versions"""
+    try:
+        # Check if google packages are already installed
+        if check_package_installed("google.generativeai"):
+            print("Google Generative AI package is already installed")
+            return True
+            
+        print("Installing Google packages...")
+        packages = [
+            "protobuf>=4.23.0",
+            "google-api-python-client",
+            "google-api-core",
+            "google-cloud-core",
+            "google-generativeai>=0.3.0"
+        ]
+        
+        # Install packages one by one to better handle errors
+        for package in packages:
+            try:
+                print(f"Installing {package}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+                print(f"{package} installed successfully")
+            except Exception as e:
+                print(f"Error installing {package}: {e}")
+                
+        # Install LangChain integration packages
+        langchain_packages = [
+            "langchain-google-genai",
+            "langchain_google_genai"
+        ]
+        
+        for package in langchain_packages:
+            try:
+                print(f"Installing {package}...")
+                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+                print(f"{package} installed successfully")
+            except Exception as e:
+                print(f"Error installing {package}: {e}")
+        
+        # Verify installation by importing
+        try:
+            import google.generativeai
+            print("Google packages installed and verified successfully")
+            return True
+        except ImportError as e:
+            print(f"Failed to import Google packages after installation: {e}")
+            return False
+            
+    except Exception as e:
+        print(f"Error ensuring Google packages: {e}")
+        return False
+
+# Try to install Google packages at startup
+ensure_google_packages()
+
 # Conditionally import fcntl as it's only available on Unix-like systems
 try:
     import fcntl
@@ -1816,13 +1882,13 @@ class PromptLibraryDialog(wx.Dialog):
         # Clear the list
         self.prompt_list.Clear()
         
-        # Get all JSON files from the Prompts directory
+        # Get all JSON and TXT files from the Prompts directory
         if os.path.exists(self.prompts_dir):
             prompt_files = [f for f in os.listdir(self.prompts_dir) 
                            if os.path.isfile(os.path.join(self.prompts_dir, f)) 
-                           and f.lower().endswith('.json')]
+                           and (f.lower().endswith('.json') or f.lower().endswith('.txt'))]
             
-            # Add each file to the list (without .json extension)
+            # Add each file to the list (without extension)
             for prompt_file in prompt_files:
                 prompt_name = os.path.splitext(prompt_file)[0]
                 self.prompt_list.Append(prompt_name)
@@ -1839,16 +1905,34 @@ class PromptLibraryDialog(wx.Dialog):
                                      wx.YES_NO | wx.ICON_QUESTION)
             
             if dialog.ShowModal() == wx.ID_YES:
-                # Delete the prompt file
-                file_path = os.path.join(self.prompts_dir, f"{prompt_name}.json")
-                try:
-                    os.remove(file_path)
-                    # Update the list
+                # Create paths for both possible extensions
+                json_path = os.path.join(self.prompts_dir, f"{prompt_name}.json") 
+                txt_path = os.path.join(self.prompts_dir, f"{prompt_name}.txt")
+                deleted = False
+                
+                # Try to delete JSON file if it exists
+                if os.path.exists(json_path):
+                    try:
+                        os.remove(json_path)
+                        deleted = True
+                        log_message(f"Deleted JSON prompt: {prompt_name}")
+                    except Exception as e:
+                        log_message(f"Error deleting JSON prompt: {str(e)}", True)
+                        
+                # Try to delete TXT file if it exists
+                if os.path.exists(txt_path):
+                    try:
+                        os.remove(txt_path)
+                        deleted = True
+                        log_message(f"Deleted TXT prompt: {prompt_name}")
+                    except Exception as e:
+                        log_message(f"Error deleting TXT prompt: {str(e)}", True)
+                
+                # Update the list if any file was deleted
+                if deleted:
                     self.prompt_list.Delete(selected_idx)
-                    log_message(f"Deleted prompt: {prompt_name}")
-                except Exception as e:
-                    log_message(f"Error deleting prompt: {str(e)}", True)
-                    wx.MessageBox(f"Error deleting prompt: {str(e)}", "Error", wx.OK | wx.ICON_ERROR)
+                else:
+                    wx.MessageBox(f"Error: Could not find or delete prompt files", "Error", wx.OK | wx.ICON_ERROR)
             
             dialog.Destroy()
     
@@ -1859,14 +1943,30 @@ class PromptLibraryDialog(wx.Dialog):
                 prompt_name = self.prompt_list.GetString(selected_idx)
                 self.selected_prompt = prompt_name
                 
-                file_path = os.path.join(self.prompts_dir, f"{prompt_name}.json")
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        prompt_data = json.load(f)
-                        return prompt_data.get("content", "")
-                except Exception as e:
-                    log_message(f"Error loading prompt: {str(e)}", True)
-                    return ""
+                # Try JSON format first
+                json_path = os.path.join(self.prompts_dir, f"{prompt_name}.json")
+                txt_path = os.path.join(self.prompts_dir, f"{prompt_name}.txt")
+                
+                # Check if JSON file exists
+                if os.path.exists(json_path):
+                    try:
+                        with open(json_path, 'r', encoding='utf-8') as f:
+                            prompt_data = json.load(f)
+                            return prompt_data.get("content", "")
+                    except Exception as e:
+                        log_message(f"Error loading JSON prompt: {str(e)}", True)
+                        return ""
+                
+                # If JSON doesn't exist or failed, try TXT format
+                elif os.path.exists(txt_path):
+                    try:
+                        with open(txt_path, 'r', encoding='utf-8') as f:
+                            return f.read()
+                    except Exception as e:
+                        log_message(f"Error loading TXT prompt: {str(e)}", True)
+                        return ""
+                        
+                return ""
             return ""
         else:
             return self.current_prompt
@@ -1876,6 +1976,44 @@ class PromptLibraryDialog(wx.Dialog):
             return self.selected_prompt
         else:
             return self.name_field.GetValue()
+
+class MessageEditDialog(wx.Dialog):
+    def __init__(self, parent, message, title="Edit Message"):
+        super(MessageEditDialog, self).__init__(parent, title=title, size=(500, 300))
+        
+        # Create a panel and sizer
+        panel = wx.Panel(self)
+        sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Add message text control
+        self.text_ctrl = wx.TextCtrl(panel, value=message, style=wx.TE_MULTILINE)
+        sizer.Add(self.text_ctrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        
+        # Add buttons
+        btn_sizer = wx.StdDialogButtonSizer()
+        save_btn = wx.Button(panel, wx.ID_OK, "Save")
+        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        
+        btn_sizer.AddButton(save_btn)
+        btn_sizer.AddButton(cancel_btn)
+        btn_sizer.Realize()
+        
+        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        
+        # Set the sizer
+        panel.SetSizer(sizer)
+        
+        # Bind events
+        save_btn.Bind(wx.EVT_BUTTON, self.on_save)
+        
+        # Center the dialog
+        self.Centre()
+        
+    def on_save(self, event):
+        event.Skip()
+        
+    def GetMessage(self):
+        return self.text_ctrl.GetValue()
 
 # Main application class
 class ResearchAssistantApp(wx.Frame):
@@ -3078,10 +3216,11 @@ class ResearchAssistantApp(wx.Frame):
                     prompts_dir = os.path.join(self.base_path, "Prompts")
                     os.makedirs(prompts_dir, exist_ok=True)
                     
-                    # Save the prompt
-                    prompt_path = os.path.join(prompts_dir, f"{prompt_name}.txt")
+                    # Save the prompt as JSON
+                    prompt_path = os.path.join(prompts_dir, f"{prompt_name}.json")
+                    prompt_data = {"content": current_prompt}
                     with open(prompt_path, 'w', encoding='utf-8') as f:
-                        f.write(current_prompt)
+                        json.dump(prompt_data, f, ensure_ascii=False, indent=2)
                     
                     log_message(f"Prompt saved as: {prompt_name}")
                     wx.MessageBox(f"Prompt saved as: {prompt_name}", "Prompt Saved", wx.OK | wx.ICON_INFORMATION)
@@ -3977,12 +4116,60 @@ class LLMClient:
                 from openai import OpenAI
                 self.client = OpenAI(api_key=self.api_key)
             elif self.model_key == "anthropic":
-                from anthropic import Anthropic
-                self.client = Anthropic(api_key=self.api_key)
+                if check_package_installed("anthropic"):
+                    from anthropic import Anthropic
+                    self.client = Anthropic(api_key=self.api_key)
+                else:
+                    log_message("Anthropic package not installed. Installing required packages...", True)
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "anthropic"])
+                    log_message("Anthropic package installed successfully. Initializing client...")
+                    from anthropic import Anthropic
+                    self.client = Anthropic(api_key=self.api_key)
             elif self.model_key == "gemini":
-                import google.generativeai as genai
-                genai.configure(api_key=self.api_key)
-                self.client = genai
+                # Google package installation requires special handling
+                try:
+                    # First try to import directly
+                    log_message("Attempting to import Google packages...")
+                    import google.generativeai as genai
+                    genai.configure(api_key=self.api_key)
+                    self.client = genai
+                    log_message("Successfully imported Google Generative AI package")
+                except ImportError:
+                    # If import fails, install packages one by one
+                    log_message("Google packages not found or incomplete. Installing required packages...", True)
+                    packages = [
+                        "google-api-python-client",
+                        "google-api-core",
+                        "google-cloud-core",
+                        "google-cloud",
+                        "google-generativeai"
+                    ]
+                    
+                    # Install each package individually and report success/failure
+                    for package in packages:
+                        try:
+                            log_message(f"Installing {package}...")
+                            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+                            log_message(f"Successfully installed {package}")
+                        except Exception as e:
+                            log_message(f"Error installing {package}: {str(e)}", True)
+                    
+                    # Force Python to reload modules
+                    log_message("Reloading modules...")
+                    if 'google' in sys.modules:
+                        del sys.modules['google']
+                    if 'google.generativeai' in sys.modules:
+                        del sys.modules['google.generativeai']
+                    
+                    # Try import again after installation
+                    try:
+                        import google.generativeai as genai
+                        genai.configure(api_key=self.api_key)
+                        self.client = genai
+                        log_message("Successfully imported Google Generative AI package after installation")
+                    except ImportError as e:
+                        log_message(f"Failed to import Google packages after installation: {str(e)}", True)
+                        raise ValueError(f"Could not initialize Google Generative AI. Error: {str(e)}")
             else:
                 log_message(f"Unsupported model provider: {self.model_key}", True)
                 self.client = None
@@ -3998,26 +4185,99 @@ class LLMClient:
                 
             # Create the appropriate model based on the provider
             if self.model_key == "openai":
-                from langchain_openai import ChatOpenAI
-                return ChatOpenAI(
-                    model=self.model_id,
-                    openai_api_key=self.api_key,
-                    temperature=0.7
-                )
+                try:
+                    from langchain_openai import ChatOpenAI
+                    return ChatOpenAI(
+                        model=self.model_id,
+                        openai_api_key=self.api_key,
+                        temperature=0.7
+                    )
+                except ImportError:
+                    log_message("langchain_openai not installed. Installing required package...", True)
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "langchain_openai"])
+                    from langchain_openai import ChatOpenAI
+                    return ChatOpenAI(
+                        model=self.model_id,
+                        openai_api_key=self.api_key,
+                        temperature=0.7
+                    )
             elif self.model_key == "anthropic":
-                from langchain_anthropic import ChatAnthropic
-                return ChatAnthropic(
-                    model=self.model_id,
-                    anthropic_api_key=self.api_key,
-                    temperature=0.7
-                )
+                try:
+                    from langchain_anthropic import ChatAnthropic
+                    return ChatAnthropic(
+                        model=self.model_id,
+                        anthropic_api_key=self.api_key,
+                        temperature=0.7
+                    )
+                except ImportError:
+                    log_message("langchain_anthropic not installed. Installing required package...", True)
+                    subprocess.check_call([sys.executable, "-m", "pip", "install", "langchain_anthropic", "anthropic"])
+                    from langchain_anthropic import ChatAnthropic
+                    return ChatAnthropic(
+                        model=self.model_id,
+                        anthropic_api_key=self.api_key,
+                        temperature=0.7
+                    )
             elif self.model_key == "gemini":
-                from langchain_google_genai import ChatGoogleGenerativeAI
-                return ChatGoogleGenerativeAI(
-                    model=self.model_id,
-                    google_api_key=self.api_key,
-                    temperature=0.7
-                )
+                try:
+                    # First check if the Google integration is available
+                    log_message("Checking for langchain_google_genai integration...")
+                    import importlib.util
+                    if importlib.util.find_spec("langchain_google_genai") is None:
+                        log_message("langchain_google_genai not found. Installing required packages...", True)
+                        required_packages = [
+                            "langchain_google_genai",
+                            "google-generativeai>=0.3.0",
+                            "google-api-python-client",
+                            "google-api-core"
+                        ]
+                        # Install each package individually
+                        for package in required_packages:
+                            try:
+                                log_message(f"Installing {package}...")
+                                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", package])
+                                log_message(f"Successfully installed {package}")
+                            except Exception as e:
+                                log_message(f"Error installing {package}: {str(e)}", True)
+                    
+                    # Force reload of modules
+                    if 'langchain_google_genai' in sys.modules:
+                        del sys.modules['langchain_google_genai']
+                    if 'google' in sys.modules:
+                        del sys.modules['google']
+                    if 'google.generativeai' in sys.modules:
+                        del sys.modules['google.generativeai']
+                    
+                    # Try importing and creating the model
+                    log_message("Importing langchain_google_genai...")
+                    from langchain_google_genai import ChatGoogleGenerativeAI
+                    log_message(f"Creating Google model with ID: {self.model_id}")
+                    return ChatGoogleGenerativeAI(
+                        model=self.model_id,
+                        google_api_key=self.api_key,
+                        temperature=0.7
+                    )
+                except ImportError as e:
+                    log_message(f"Error importing langchain_google_genai: {str(e)}", True)
+                    log_message("Attempting alternative installation methods...", True)
+                    try:
+                        # Try direct pip install with system call
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", 
+                                             "langchain-google-genai", "google-generativeai"])
+                        
+                        # Import after installation
+                        from langchain_google_genai import ChatGoogleGenerativeAI
+                        return ChatGoogleGenerativeAI(
+                            model=self.model_id,
+                            google_api_key=self.api_key,
+                            temperature=0.7
+                        )
+                    except Exception as e2:
+                        log_message(f"Failed to install and import langchain_google_genai: {str(e2)}", True)
+                        raise ImportError(f"Could not setup Google Generative AI integration: {str(e2)}")
+                except Exception as e:
+                    log_message(f"Error creating Google Generative AI model: {str(e)}", True)
+                    raise ValueError(f"Error creating Google model: {str(e)}")
             else:
                 return None
         except Exception as e:
@@ -4050,36 +4310,131 @@ class LLMClient:
                         
             elif self.model_key == "anthropic":
                 # Anthropic streaming
-                response = self.client.messages.create(
-                    model=self.model_id,
-                    max_tokens=4000,
-                    messages=[{"role": "user", "content": prompt}],
-                    stream=True
-                )
-                
-                # Process the streaming response
-                for chunk in response:
-                    if chunk.type == 'content_block_delta' and hasattr(chunk, 'delta') and hasattr(chunk.delta, 'text'):
-                        content = chunk.delta.text
-                        if callback:
-                            callback(content)
-                        yield content
+                try:
+                    response = self.client.messages.create(
+                        model=self.model_id,
+                        max_tokens=4000,
+                        messages=[{"role": "user", "content": prompt}],
+                        stream=True
+                    )
+                    
+                    # Process the streaming response
+                    for chunk in response:
+                        if chunk.type == 'content_block_delta' and hasattr(chunk, 'delta') and hasattr(chunk.delta, 'text'):
+                            content = chunk.delta.text
+                            if callback:
+                                callback(content)
+                            yield content
+                except AttributeError as e:
+                    # Anthropic API might have changed
+                    log_message(f"Error with Anthropic streaming: {str(e)}. Trying alternative API...", True)
+                    response = self.client.completions.create(
+                        prompt=f"\n\nHuman: {prompt}\n\nAssistant:",
+                        model=self.model_id,
+                        max_tokens_to_sample=4000,
+                        stream=True
+                    )
+                    for completion in response:
+                        if hasattr(completion, 'completion'):
+                            content = completion.completion
+                            if callback:
+                                callback(content)
+                            yield content
                         
             elif self.model_key == "gemini":
-                # Gemini streaming
-                model = self.client.GenerativeModel(self.model_id)
-                response = model.generate_content(
-                    prompt,
-                    stream=True
-                )
+                # First ensure the necessary packages are installed
+                log_message("Ensuring Google packages are installed for streaming...")
                 
-                # Process the streaming response
-                for chunk in response:
-                    if chunk.text:
-                        content = chunk.text
+                if not check_package_installed("google.generativeai"):
+                    log_message("Google Generative AI package not found. Installing...", True)
+                    try:
+                        # Install the package
+                        subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", 
+                                             "google-generativeai>=0.3.0", 
+                                             "google-api-python-client"])
+                        
+                        # Force reload of modules
+                        if 'google' in sys.modules:
+                            del sys.modules['google']
+                        if 'google.generativeai' in sys.modules:
+                            del sys.modules['google.generativeai']
+                        
+                        # Import the package
+                        import google.generativeai as genai
+                        genai.configure(api_key=self.api_key)
+                        self.client = genai
+                    except Exception as e:
+                        error_msg = f"Failed to install Google packages: {str(e)}"
+                        log_message(error_msg, True)
                         if callback:
-                            callback(content)
-                        yield content
+                            callback(f"\n\nError: {error_msg}")
+                        yield f"\n\nError: {error_msg}"
+                        return
+                
+                # Try to use the client for streaming
+                try:
+                    # Log the model being used
+                    log_message(f"Using Gemini model: {self.model_id}")
+                    
+                    # Create model instance
+                    model = self.client.GenerativeModel(self.model_id)
+                    
+                    # Configure generation settings
+                    generation_config = {
+                        "temperature": 0.7,
+                        "top_p": 0.95,
+                        "top_k": 40,
+                        "max_output_tokens": 4000,
+                    }
+                    
+                    # Generate content with streaming
+                    response = model.generate_content(
+                        prompt,
+                        generation_config=generation_config,
+                        stream=True
+                    )
+                    
+                    # Process the streaming response
+                    for chunk in response:
+                        if hasattr(chunk, 'text') and chunk.text:
+                            content = chunk.text
+                            if callback:
+                                callback(content)
+                            yield content
+                        elif hasattr(chunk, 'parts') and len(chunk.parts) > 0:
+                            # Alternative response format
+                            for part in chunk.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    content = part.text
+                                    if callback:
+                                        callback(content)
+                                    yield content
+                
+                except AttributeError as e:
+                    # The API might have changed, try alternative method
+                    log_message(f"Attribute error with Gemini streaming: {str(e)}. Trying alternative method...", True)
+                    try:
+                        # Alternative API approach
+                        response = model.start_chat().send_message(prompt, stream=True)
+                        for chunk in response:
+                            if hasattr(chunk, 'text'):
+                                content = chunk.text
+                                if callback:
+                                    callback(content)
+                                yield content
+                    except Exception as e2:
+                        error_msg = f"Error with alternative Gemini streaming: {str(e2)}"
+                        log_message(error_msg, True)
+                        if callback:
+                            callback(f"\n\nError: {error_msg}")
+                        yield f"\n\nError: {error_msg}"
+                
+                except Exception as e:
+                    error_msg = f"Error with Gemini streaming: {str(e)}"
+                    log_message(error_msg, True)
+                    if callback:
+                        callback(f"\n\nError: {error_msg}")
+                    yield f"\n\nError: {error_msg}"
             else:
                 raise ValueError(f"Unsupported model provider: {self.model_key}")
                 
@@ -4095,6 +4450,59 @@ if __name__ == "__main__":
     try:
         # Set up logging
         log_file = setup_error_logging()
+        
+        # Check for Google packages first - most common issue
+        log_message("Checking Google packages installation...")
+        if not check_package_installed("google.generativeai"):
+            log_message("Google packages not found. Installing them now...", True)
+            ensure_google_packages()
+        
+        # Check for LLM packages and install if missing
+        required_packages = {
+            "openai": ["openai", "langchain_openai"],
+            "anthropic": ["anthropic", "langchain_anthropic"],
+            "gemini": [
+                "google-api-python-client", 
+                "google-api-core", 
+                "google-cloud-core", 
+                "google-generativeai>=0.3.0", 
+                "langchain_google_genai",
+                "langchain-google-genai",
+                "protobuf>=4.23.0"
+            ]
+        }
+        
+        # Check config for default model
+        try:
+            config = load_config()
+            default_model = config.get("default_model", "openai")
+            log_message(f"Default model is: {default_model}")
+            
+            # Install packages for the default model
+            if default_model in required_packages:
+                missing = []
+                for pkg in required_packages[default_model]:
+                    # Strip version specifier for checking
+                    base_pkg = pkg.split('>=')[0] if '>=' in pkg else pkg
+                    base_pkg = base_pkg.replace('-', '_').split('.')[0]
+                    if not check_package_installed(base_pkg):
+                        missing.append(pkg)
+                
+                if missing:
+                    log_message(f"Installing required packages for {default_model}: {', '.join(missing)}")
+                    try:
+                        for pkg in missing:
+                            # Install each package individually for better error reporting
+                            try:
+                                log_message(f"Installing {pkg}...")
+                                subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", pkg])
+                                log_message(f"Successfully installed {pkg}")
+                            except Exception as e:
+                                log_message(f"Error installing {pkg}: {str(e)}", True)
+                    except Exception as e:
+                        log_message(f"Error during package installation: {str(e)}", True)
+        except Exception as e:
+            log_message(f"Error checking/installing packages: {str(e)}", True)
         
         # Initialize wx app
         app = wx.App()

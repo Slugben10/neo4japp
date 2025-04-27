@@ -29,6 +29,21 @@ required_packages = [
     "openai",
     "pypdf",  # PDF processing
     "python-docx",  # DOCX processing
+    # Google API dependencies - more specific packages
+    "google-api-python-client",
+    "google-api-core",
+    "google-cloud-core",
+    "google-cloud",
+    "google-cloud-aiplatform",
+    "google-cloud-storage",
+    "google-generativeai>=0.3.0",  # Version constraint for newer features
+    "protobuf>=4.23.0",  # Required by google packages
+    "langchain-google-genai",  # Add hyphenated package name as fallback
+    "langchain_google_genai",  # Add underscore package name
+    # Anthropic client
+    "anthropic",
+    # Additional LangChain integrations
+    "langchain_anthropic",
 ]
 missing_packages = []
 
@@ -223,6 +238,15 @@ hidden_imports = [
     "langchain_community.document_loaders.docx",
     "langchain_experimental",
     "langchain_experimental.graph_transformers",
+    # LLM provider-specific imports
+    "openai",
+    "anthropic",
+    "google.generativeai",
+    "google.api_core",
+    "google.cloud",
+    "google.cloud.aiplatform",
+    "langchain_google_genai",
+    "langchain_anthropic",
 ]
 
 # Try to include optional packages
