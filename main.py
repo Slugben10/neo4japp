@@ -657,83 +657,51 @@ class Neo4jDatabaseManager:
             # METHOD 2: Using Graph Relationships (GraphRAG approach)
             with self.driver.session() as session:
                 if use_graph:
-                    # Extract key terms from the query using simple text processing
-                    import re
-                    from collections import Counter
-                    
-                    # Remove stop words and extract key terms
-                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'with', 'by', 'about', 'of'}
-                    words = re.findall(r'\b\w+\b', query.lower())
-                    key_terms = [w for w in words if w not in stop_words and len(w) > 2]
-                    
-                    # Get most common terms
-                    term_counts = Counter(key_terms)
-                    top_terms = [term for term, _ in term_counts.most_common(5)]
-                    
-                    # Build the search query using key terms
-                    if top_terms:
-                        # Create CONTAINS clauses for each term
-                        term_clauses = []
-                        params = {}
-                        
-                        for i, term in enumerate(top_terms):
-                            term_clauses.append(f"toLower(d.content) CONTAINS $term{i}")
-                            params[f"term{i}"] = term
-                        
-                        # Combine clauses with OR
-                        where_clause = " OR ".join(term_clauses)
-                        
-                        # Execute the query with a score based on the number of terms matched
-                        result = session.run(f"""
-                        MATCH (d:Document)
-                        WHERE {where_clause}
-                        WITH d, 
-                             reduce(score = 0, term IN [{', '.join(f'$term{i}' for i in range(len(top_terms)))}] |
-                                score + CASE WHEN toLower(d.content) CONTAINS term THEN 1 ELSE 0 END) AS score
-                        ORDER BY score DESC
-                        LIMIT $limit
-                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, score
-                        """, **params, limit=limit)
-                    else:
-                        # Fallback if no key terms found
+                    # For graph search, retrieve documents with relevant entities or matching content
+                    # First retrieve all documents as a simpler approach
+                    try:
+                        # Simple query to get all documents except the placeholder
                         result = session.run("""
                         MATCH (d:Document)
                         WHERE d.document_id <> 'placeholder'
                         RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
                         LIMIT $limit
                         """, limit=limit)
-                    
-                    # Process results
-                    try:
-                        from langchain_core.documents import Document
-                    except ImportError:
-                        log_message("langchain_core.documents not available, using custom Document class", True)
-                        # Define a simple Document class to mimic LangChain's Document
-                        class Document:
-                            def __init__(self, page_content, metadata=None):
-                                self.page_content = page_content
-                                self.metadata = metadata or {}
-                    
-                    documents = []
-                    
-                    for record in result:
-                        # Create metadata
-                        metadata = {
-                            "document_id": record["document_id"],
-                            "title": record["title"],
-                            "score": record["score"],
-                            "source": "graph_search"
-                        }
                         
-                        # Create Document
-                        doc = Document(
-                            page_content=record["content"],
-                            metadata=metadata
-                        )
-                        documents.append(doc)
-                    
-                    log_message(f"Found {len(documents)} similar documents using graph search")
-                    return documents
+                        # Process results
+                        try:
+                            from langchain_core.documents import Document
+                        except ImportError:
+                            log_message("langchain_core.documents not available, using custom Document class", True)
+                            # Define a simple Document class to mimic LangChain's Document
+                            class Document:
+                                def __init__(self, page_content, metadata=None):
+                                    self.page_content = page_content
+                                    self.metadata = metadata or {}
+                        
+                        documents = []
+                        
+                        for record in result:
+                            # Create metadata
+                            metadata = {
+                                "document_id": record["document_id"],
+                                "title": record["title"],
+                                "score": record["score"],
+                                "source": "graph_search"
+                            }
+                            
+                            # Create Document
+                            doc = Document(
+                                page_content=record["content"],
+                                metadata=metadata
+                            )
+                            documents.append(doc)
+                        
+                        log_message(f"Found {len(documents)} similar documents using graph search")
+                        return documents
+                    except Exception as e:
+                        log_message(f"Error in graph document retrieval: {str(e)}", True)
+                        return []
                 else:
                     # If vector store is not available but use_graph is False,
                     # run a basic full-text search in Neo4j as fallback
@@ -929,6 +897,15 @@ class Neo4jDatabaseManager:
                             d.content = $content,
                             d.updated_at = datetime()
                         """, doc_id=document_id, title=title, content=content)
+                        
+                        # Create relationships to other documents (simple ALL_DOCUMENTS relationship)
+                        # This ensures that all documents are connected in the graph
+                        session.run("""
+                        MATCH (d:Document {document_id: $doc_id})
+                        MATCH (other:Document)
+                        WHERE other.document_id <> $doc_id
+                        MERGE (d)-[:ALL_DOCUMENTS]->(other)
+                        """, doc_id=document_id)
                         
                         # Process graph documents to create entity nodes and relationships
                         for graph_doc in graph_documents:
@@ -3964,7 +3941,7 @@ def create_rag_chain(neo4j_manager, llm_client):
             # Get similar documents using vector search first
             vector_docs = []
             try:
-                vector_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=False)
+                vector_docs = neo4j_manager.query_similar_text(query, limit=5, use_graph=False)
                 log_message(f"Found {len(vector_docs)} similar documents using vector search")
             except Exception as e:
                 log_message(f"Error in vector search: {str(e)}", True)
@@ -3972,7 +3949,7 @@ def create_rag_chain(neo4j_manager, llm_client):
             # Get related documents using graph-based search
             graph_docs = []
             try:
-                graph_docs = neo4j_manager.query_similar_text(query, limit=3, use_graph=True)
+                graph_docs = neo4j_manager.query_similar_text(query, limit=5, use_graph=True)
                 log_message(f"Found {len(graph_docs)} similar documents using graph search")
             except Exception as e:
                 log_message(f"Error in graph search: {str(e)}", True)
@@ -3987,6 +3964,13 @@ def create_rag_chain(neo4j_manager, llm_client):
             
             # Get the final list of documents
             relevant_docs = list(unique_docs.values())
+            
+            # Log the retrieved documents for debugging
+            log_message(f"Retrieved {len(relevant_docs)} total unique documents:")
+            for doc in relevant_docs:
+                doc_id = doc.metadata.get("document_id", "unknown")
+                title = doc.metadata.get("title", "Untitled")
+                log_message(f"  - Document '{title}' (ID: {doc_id})")
             
             if not relevant_docs:
                 return "No relevant information found in the database for this query. Please try rephrasing or ask a different question."
