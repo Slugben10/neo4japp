@@ -598,34 +598,58 @@ class Neo4jDatabaseManager:
             log_message(f"Error removing document from database: {str(e)}", True)
             return False
     
-    def get_document_list(self):
-        """Get list of documents in the database"""
+    def delete_all_documents(self):
+        """Delete all documents from both Neo4j and vector databases while preserving the databases themselves"""
         try:
             if not self.connected:
                 log_message("Neo4j connection not available", True)
-                return []
-                
-            # Get unique document IDs and titles
+                return False
+
+            # STEP 1: Delete all documents from Neo4j database
             with self.driver.session() as session:
-                result = session.run(
-                    """
+                # Delete all document nodes and their relationships
+                # Exclude the placeholder document
+                session.run("""
                     MATCH (d:Document)
-                    WITH d.document_id AS id, d.title AS title, count(*) AS chunks
-                    WHERE id IS NOT NULL
-                    RETURN DISTINCT id, title, chunks
-                    ORDER BY title
-                    """
-                )
-                
-                docs = [(record["id"], record["title"], record["chunks"]) 
-                        for record in result]
-                
-            log_message(f"Retrieved list of {len(docs)} documents from database")
-            return docs
+                    WHERE d.document_id <> 'placeholder'
+                    DETACH DELETE d
+                """)
+                log_message("Deleted all documents from Neo4j database")
+
+            # STEP 2: Reinitialize vector store to clear it
+            if LANGCHAIN_AVAILABLE and self.vector_store:
+                try:
+                    # Reinitialize the vector store with empty state
+                    self.vector_store = Neo4jVectorStore4x(
+                        driver=self.driver,
+                        embedding_function=self.vector_store.embedding_function
+                    )
+                    log_message("Vector store reinitialized and cleared")
+                except Exception as e:
+                    log_message(f"Error reinitializing vector store: {str(e)}", True)
+                    # Continue even if vector store reinitialization fails
+
+            log_message("All documents deleted successfully")
+            return True
         except Exception as e:
-            log_message(f"Error getting document list from database: {str(e)}", True)
+            log_message(f"Error deleting all documents: {str(e)}", True)
+            return False
+    
+    def get_document_list(self):
+        """Get list of documents in the database"""
+        try:
+            with self.driver.session(database=self.database) as session:
+                result = session.run("""
+                    MATCH (d:Document)
+                    WHERE d.title IS NOT NULL AND d.title <> 'None' AND d.id <> 'placeholder'
+                    RETURN d.id as id, d.title as title, d.chunks as chunks
+                    ORDER BY d.title
+                """)
+                return [(record["id"], record["title"], record["chunks"]) for record in result]
+        except Exception as e:
+            log_message(f"Error getting document list: {str(e)}", True)
             return []
-            
+    
     def query_similar_text(self, query, limit=5, use_graph=False):
         """Query for similar text chunks using vector store or graph relationships
         
@@ -909,40 +933,36 @@ class Neo4jDatabaseManager:
                         
                         # Process graph documents to create entity nodes and relationships
                         for graph_doc in graph_documents:
-                            # Check if the graph document has entities
+                            # Check for both nodes and entities attributes
+                            nodes_to_process = []
+                            if hasattr(graph_doc, 'nodes') and graph_doc.nodes:
+                                nodes_to_process.extend(graph_doc.nodes)
                             if hasattr(graph_doc, 'entities') and graph_doc.entities:
-                                # Add entities
-                                for entity in graph_doc.entities:
-                                    # Create entity node
-                                    entity_id = entity.id
-                                    entity_type = entity.entity_type
-                                    entity_properties = {}
-                                    
-                                    # Extract safe properties
-                                    for k, v in entity.properties.items():
-                                        if isinstance(v, (str, int, float, bool)):
-                                            entity_properties[k] = v
-                                    
-                                    # Build the query dynamically
-                                    query = f"""
-                                    MERGE (e:`{entity_type}` {{id: $id}})
-                                    """
-                                    
-                                    # Add SET clause if there are properties
-                                    if entity_properties:
-                                        query += "SET " + ", ".join([f"e.{k} = ${k}" for k in entity_properties.keys()])
-                                    
-                                    # Execute query
-                                    params = {"id": entity_id}
-                                    params.update(entity_properties)
-                                    session.run(query, **params)
-                                    
-                                    # Connect entity to document
-                                    session.run("""
-                                    MATCH (d:Document {document_id: $doc_id})
-                                    MATCH (e {id: $entity_id})
-                                    MERGE (d)-[:CONTAINS]->(e)
-                                    """, doc_id=document_id, entity_id=entity_id)
+                                nodes_to_process.extend(graph_doc.entities)
+                            
+                            # Process all nodes/entities
+                            for node in nodes_to_process:
+                                # Create node with properties
+                                node_properties = {}
+                                for key, value in node.properties.items():
+                                    if isinstance(value, (str, int, float, bool)):
+                                        node_properties[key] = value
+                                
+                                # Get node type
+                                node_type = getattr(node, 'type', getattr(node, 'entity_type', 'Entity'))
+                                
+                                # Create the node with its label
+                                session.run(f"""
+                                MERGE (n:`{node_type}` {{id: $id}})
+                                SET n += $properties
+                                """, id=node.id, properties=node_properties)
+                                
+                                # Connect to document
+                                session.run("""
+                                MATCH (d:Document {document_id: $doc_id})
+                                MATCH (n {id: $node_id})
+                                MERGE (d)-[:CONTAINS]->(n)
+                                """, doc_id=document_id, node_id=node.id)
                             
                             # Check if the graph document has relationships
                             if hasattr(graph_doc, 'relationships') and graph_doc.relationships:
@@ -2072,7 +2092,7 @@ class ResearchAssistantApp(wx.Frame):
     def _start_neo4j_server_with_retry(self):
         """Start Neo4j server with retry logic"""
         max_retries = 3
-        timeout_seconds = 60  # Increase timeout to 60 seconds for slower systems
+        timeout_seconds = 180  # Increased timeout to 180 seconds (3 minutes) for slower systems
         
         # Create a flag to track timeout
         self.neo4j_startup_timed_out = False
@@ -2593,10 +2613,22 @@ class ResearchAssistantApp(wx.Frame):
             delete_from_db_btn = wx.Button(db_actions_panel, label="Delete from Database")
             delete_from_db_btn.SetToolTip("Delete selected documents from database")
             delete_from_db_btn.Bind(wx.EVT_BUTTON, self.on_delete_from_database)
-            db_actions_sizer.Add(delete_from_db_btn, 1)
+            db_actions_sizer.Add(delete_from_db_btn, 1, wx.RIGHT, 5)
+
+            # Delete All Documents button
+            delete_all_btn = wx.Button(db_actions_panel, label="Delete All Documents")
+            delete_all_btn.SetToolTip("Delete all documents from both Neo4j and vector databases")
+            delete_all_btn.Bind(wx.EVT_BUTTON, self.on_delete_all_documents)
+            db_actions_sizer.Add(delete_all_btn, 1)
             
             db_actions_panel.SetSizer(db_actions_sizer)
             rag_sizer.Add(db_actions_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+            # Show Database Documents button
+            show_db_docs_btn = wx.Button(rag_panel, label="Show Database Documents")
+            show_db_docs_btn.SetToolTip("Show documents in vector database and Neo4j database")
+            show_db_docs_btn.Bind(wx.EVT_BUTTON, self.on_show_database_documents)
+            rag_sizer.Add(show_db_docs_btn, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
             
             # GraphRAG/RAG selection
             rag_type_panel = wx.Panel(rag_panel)
@@ -3125,6 +3157,52 @@ class ResearchAssistantApp(wx.Frame):
             log_message(traceback.format_exc(), True)
             wx.MessageBox(
                 f"Error deleting documents from database: {str(e)}",
+                "Deletion Error",
+                wx.OK | wx.ICON_ERROR
+            )
+    
+    def on_delete_all_documents(self, event):
+        """Handle delete all documents button event"""
+        try:
+            if not self.neo4j_manager or not self.neo4j_manager.connected:
+                wx.MessageBox(
+                    "Not connected to Neo4j database. Please ensure the database is running.",
+                    "Connection Error",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+
+            # Show confirmation dialog
+            confirm = wx.MessageBox(
+                "Are you sure you want to delete ALL documents from both Neo4j and vector databases?\n\n"
+                "This action cannot be undone, but you can upload the documents again later.",
+                "Confirm Delete All",
+                wx.YES_NO | wx.ICON_WARNING
+            )
+
+            if confirm == wx.YES:
+                # Delete all documents
+                success = self.neo4j_manager.delete_all_documents()
+                
+                if success:
+                    wx.MessageBox(
+                        "All documents have been successfully deleted from both databases.",
+                        "Deletion Complete",
+                        wx.OK | wx.ICON_INFORMATION
+                    )
+                    # Refresh the document list
+                    self.refresh_document_list()
+                else:
+                    wx.MessageBox(
+                        "Failed to delete all documents. Please check the logs for details.",
+                        "Deletion Failed",
+                        wx.OK | wx.ICON_ERROR
+                    )
+        except Exception as e:
+            log_message(f"Error deleting all documents: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            wx.MessageBox(
+                f"Error deleting all documents: {str(e)}",
                 "Deletion Error",
                 wx.OK | wx.ICON_ERROR
             )
@@ -3680,6 +3758,63 @@ class ResearchAssistantApp(wx.Frame):
             self.user_input.Enable()
             self.SetStatusText(f"Error: {str(e)}")
 
+    def on_show_database_documents(self, event):
+        """Show documents in both vector database and Neo4j database"""
+        try:
+            if not self.db_initialized or not self.neo4j_manager:
+                wx.MessageBox(
+                    "Database not initialized. Please wait for initialization to complete.",
+                    "Database Error",
+                    wx.OK | wx.ICON_ERROR
+                )
+                return
+
+            # Get documents from Neo4j database
+            docs = self.neo4j_manager.get_document_list()
+            
+            if not docs:
+                wx.MessageBox(
+                    "No documents found in the database.",
+                    "No Documents",
+                    wx.OK | wx.ICON_INFORMATION
+                )
+                return
+
+            # Create a dialog to display the documents
+            dialog = wx.Dialog(self, title="Documents in Database", size=(800, 600))
+            panel = wx.Panel(dialog)
+            sizer = wx.BoxSizer(wx.VERTICAL)
+
+            # Create a text control with a scrollbar
+            text_ctrl = wx.TextCtrl(panel, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2 | wx.HSCROLL)
+            
+            # Format the document list
+            doc_text = f"Documents in Database ({len(docs)} total):\n\n"
+            for doc_id, title, chunks in docs:
+                doc_text += f"Title: {title}\n"
+                doc_text += f"ID: {doc_id}\n"
+                doc_text += f"Chunks: {chunks}\n"
+                doc_text += "-" * 80 + "\n"
+
+            text_ctrl.SetValue(doc_text)
+            sizer.Add(text_ctrl, 1, wx.EXPAND | wx.ALL, 10)
+
+            # Add a close button
+            close_btn = wx.Button(panel, label="Close")
+            close_btn.Bind(wx.EVT_BUTTON, lambda e: dialog.EndModal(wx.ID_OK))
+            sizer.Add(close_btn, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+
+            panel.SetSizer(sizer)
+            dialog.ShowModal()
+            dialog.Destroy()
+
+        except Exception as e:
+            log_message(f"Error showing database documents: {str(e)}", True)
+            wx.MessageBox(
+                f"Error showing database documents:\n{str(e)}",
+                "Error",
+                wx.OK | wx.ICON_ERROR
+            )
 
 # Dialog for editing conversation history
 class ConversationHistoryDialog(wx.Dialog):
