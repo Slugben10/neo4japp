@@ -146,3 +146,5 @@ Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/mai
 Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/main.py
 Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/main.py
 Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/main.py
+Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/main.py
+Application starting at /Users/binobenjamin/Documents/Neo4jResearchAssistant/main.py

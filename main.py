@@ -641,8 +641,8 @@ class Neo4jDatabaseManager:
             with self.driver.session(database=self.database) as session:
                 result = session.run("""
                     MATCH (d:Document)
-                    WHERE d.title IS NOT NULL AND d.title <> 'None' AND d.id <> 'placeholder'
-                    RETURN d.id as id, d.title as title, d.chunks as chunks
+                    WHERE d.title IS NOT NULL AND d.title <> 'None' AND d.document_id <> 'placeholder'
+                    RETURN d.document_id as id, d.title as title, COUNT((d)-[:CONTAINS]->()) as chunks
                     ORDER BY d.title
                 """)
                 return [(record["id"], record["title"], record["chunks"]) for record in result]
@@ -3592,6 +3592,9 @@ class ResearchAssistantApp(wx.Frame):
                     edited_content = edit_dialog.GetMessage()
                     self.conversation_history[selected_index]["content"] = edited_content
                     
+                    # Store original message role
+                    edited_message_role = self.conversation_history[selected_index]["role"]
+                    
                     # Redraw chat display up to the edited message
                     self.chat_display.Clear()
                     self.message_positions = []
@@ -3604,13 +3607,25 @@ class ResearchAssistantApp(wx.Frame):
                     # Remove all messages after the edited one
                     self.conversation_history = self.conversation_history[:selected_index+1]
                     
-                    # Disable input during processing
-                    self.user_input.Disable()
-                    self.SetStatusText("Processing edited message...")
-                    
-                    # Process the edited message - use the last message in the conversation history
-                    # which is the edited message we just updated
-                    threading.Thread(target=self.process_message, args=(self.conversation_history[-1]["content"],), daemon=True).start()
+                    # Only process the message if it's a user message
+                    if edited_message_role == "user":
+                        # Disable input during processing
+                        self.user_input.Disable()
+                        self.SetStatusText("Processing edited message...")
+                        
+                        # Create a copy of the edited message content for processing
+                        message_to_process = edited_content
+                        
+                        # Process the edited message in a separate thread to avoid UI freezing
+                        threading.Thread(
+                            target=self.process_edited_message,
+                            args=(message_to_process, selected_index),
+                            daemon=True
+                        ).start()
+                    else:
+                        # If editing an assistant message, just update the UI
+                        log_message("Assistant message edited, not reprocessing")
+                        self.SetStatusText("Message edited successfully")
                 
                 edit_dialog.Destroy()
             else:
@@ -3620,6 +3635,89 @@ class ResearchAssistantApp(wx.Frame):
             log_message(error_msg, True)
             log_message(traceback.format_exc(), True)
             self.SetStatusText(error_msg)
+    
+    def process_edited_message(self, message_content, message_index):
+        """Process an edited message with proper error handling for all LLM types"""
+        try:
+            # Get LLM client instance
+            llm_client = self.get_llm_client()
+            if not llm_client:
+                error_msg = "Could not initialize language model. Please check your configuration."
+                wx.CallAfter(self.handle_edit_error, error_msg)
+                return
+            
+            # Initialize streaming response container
+            self.current_streaming_response = ""
+            
+            # Create a system prompt with conversation context (shortened version)
+            system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
+            
+            # Build a clean prompt with just the current message to avoid context issues
+            full_prompt = f"{system_prompt}\n\nUser: {message_content}\n\nAssistant:"
+            
+            # Process streaming response
+            response_chunks = []
+            
+            # Define the callback for streaming updates
+            def update_response_callback(chunk):
+                # Post event to main thread for UI update
+                evt = StreamEvent(text=chunk)
+                wx.PostEvent(self, evt)
+            
+            # Try to process with the appropriate model
+            try:
+                for chunk in llm_client.generate_streaming(full_prompt, callback=update_response_callback):
+                    response_chunks.append(chunk)
+                
+                # Combine chunks for the final response
+                response = "".join(response_chunks)
+                
+                # Use CallAfter to update UI from the thread
+                wx.CallAfter(self.handle_edited_response, response)
+                
+            except Exception as model_error:
+                error_msg = f"Error processing with selected model: {str(model_error)}"
+                log_message(error_msg, True)
+                
+                # Try a fallback approach if necessary
+                wx.CallAfter(self.handle_edit_error, error_msg)
+                
+        except Exception as e:
+            error_msg = f"Error processing edited message: {str(e)}"
+            log_message(error_msg, True)
+            log_message(traceback.format_exc(), True)
+            wx.CallAfter(self.handle_edit_error, error_msg)
+    
+    def handle_edited_response(self, response):
+        """Handle the response from the language model after an edit"""
+        try:
+            # Only append if it's not already a streaming response
+            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
+                self.append_to_chat(response, "Assistant")
+            else:
+                # Reset streaming state
+                self.current_streaming_response = None
+            
+            # Add to conversation history
+            self.conversation_history.append({"role": "assistant", "content": response})
+            
+            # Re-enable input and update status
+            self.user_input.Enable()
+            self.SetStatusText("Message edited successfully")
+            
+        except Exception as e:
+            error_msg = f"Error handling edited response: {str(e)}"
+            log_message(error_msg, True)
+            self.handle_edit_error(error_msg)
+    
+    def handle_edit_error(self, error_msg):
+        """Handle errors during the edit process"""
+        # Re-enable input
+        self.user_input.Enable()
+        # Update status
+        self.SetStatusText(f"Edit error: {error_msg}")
+        # Log the error
+        log_message(f"Edit error: {error_msg}", True)
     
     def rebuild_message_positions(self):
         try:
@@ -3979,7 +4077,6 @@ class ResearchAssistantApp(wx.Frame):
             for doc_id, title, chunks in docs:
                 doc_text += f"Title: {title}\n"
                 doc_text += f"ID: {doc_id}\n"
-                doc_text += f"Chunks: {chunks}\n"
                 doc_text += "-" * 80 + "\n"
 
             text_ctrl.SetValue(doc_text)
