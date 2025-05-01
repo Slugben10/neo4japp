@@ -879,8 +879,12 @@ class Neo4jDatabaseManager:
             try:
                 api_key = os.environ.get("OPENAI_API_KEY")
                 if api_key:
-                    llm = ChatOpenAI(temperature=0, model="gpt-3.5-turbo")
-                    log_message("Using OpenAI for knowledge graph extraction")
+                    llm = ChatOpenAI(
+                        temperature=0.2,  # Slightly higher temperature for more creative extraction
+                        model="gpt-4o-mini",
+                        max_tokens=4000   # Ensure enough output tokens
+                    )
+                    log_message("Using OpenAI GPT-4o-mini for knowledge graph extraction")
                 else:
                     log_message("OpenAI API key not found", True)
                     raise ValueError("OpenAI API key not available")
@@ -907,10 +911,66 @@ class Neo4jDatabaseManager:
             # Create graph transformer and convert documents
             if llm:
                 try:
-                    llm_transformer = LLMGraphTransformer(llm=llm)
+                    # Define graph schema with allowed nodes and relationships
+                    allowed_nodes = ["Person", "Organization", "Location", "Concept", "Technology", "Event", 
+                                   "Process", "Product", "Publication", "ResearchField", "Award", "Date", "Skill"]
+                    
+                    # Define relationships as source-type-target tuples for more precise structure
+                    allowed_relationships = [
+                        ("Person", "WORKS_FOR", "Organization"),
+                        ("Person", "KNOWS", "Person"),
+                        ("Person", "DEVELOPED", "Technology"),
+                        ("Person", "AUTHOR_OF", "Publication"),
+                        ("Person", "RESEARCHES", "ResearchField"),
+                        ("Person", "BORN_IN", "Date"),
+                        ("Person", "DIED_IN", "Date"),
+                        ("Person", "WON", "Award"),
+                        ("Person", "HAS_AWARD", "Award"),
+                        ("Person", "PRODUCED", "Skill"),
+                        ("Organization", "LOCATED_IN", "Location"),
+                        ("Organization", "DEVELOPS", "Technology"),
+                        ("Organization", "COLLABORATES_WITH", "Organization"),
+                        ("Publication", "CITES", "Publication"),
+                        ("Publication", "RELATES_TO", "Concept"),
+                        ("Technology", "USED_IN", "Process"),
+                        ("Product", "USES", "Technology"),
+                        ("Concept", "RELATED_TO", "Concept"),
+                        ("ResearchField", "SUBFIELD_OF", "ResearchField")
+                    ]
+                    
+                    # Define node properties to capture
+                    node_properties = ["name", "description", "date", "url", "role", "field", "type", 
+                                     "category", "birth_date", "death_date", "nationality"]
+                    
+                    # Define relationship properties to capture
+                    relationship_properties = ["start_date", "end_date", "strength", "source", "context"]
+                    
+                    # Create transformer with defined schema
+                    llm_transformer = LLMGraphTransformer(
+                        llm=llm,
+                        allowed_nodes=allowed_nodes,
+                        allowed_relationships=allowed_relationships,
+                        node_properties=node_properties,
+                        relationship_properties=relationship_properties,
+                        strict_mode=False  # Allow more flexible extraction
+                    )
                     
                     # Convert documents to graph format
                     graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+                    
+                    # Debug: Log the structure of graph documents
+                    for i, graph_doc in enumerate(graph_documents):
+                        has_nodes = hasattr(graph_doc, 'nodes') and bool(graph_doc.nodes)
+                        has_relationships = hasattr(graph_doc, 'relationships') and bool(graph_doc.relationships)
+                        log_message(f"Graph document {i}: Has nodes: {has_nodes}, Has relationships: {has_relationships}")
+                        if has_nodes:
+                            log_message(f"  - Node count: {len(graph_doc.nodes)}")
+                            for j, node in enumerate(graph_doc.nodes[:3]):  # Log first 3 nodes
+                                log_message(f"  - Node {j}: Type: {node.type if hasattr(node, 'type') else 'Unknown'}, ID: {node.id if hasattr(node, 'id') else 'Unknown'}")
+                        if has_relationships:
+                            log_message(f"  - Relationship count: {len(graph_doc.relationships)}")
+                            for j, rel in enumerate(graph_doc.relationships[:3]):  # Log first 3 relationships
+                                log_message(f"  - Relationship {j}: Type: {rel.type}, Source: {rel.source.id if hasattr(rel.source, 'id') else 'Unknown'}, Target: {rel.target.id if hasattr(rel.target, 'id') else 'Unknown'}")
                     
                     # Add to graph database with base entity label
                     with self.driver.session() as session:
@@ -931,44 +991,45 @@ class Neo4jDatabaseManager:
                         MERGE (d)-[:ALL_DOCUMENTS]->(other)
                         """, doc_id=document_id)
                         
-                        # Process graph documents to create entity nodes and relationships
+                        # Process graph documents
+                        graph_document_count = 0
+                        
+                        # Tracking if we successfully created any knowledge graph nodes
+                        created_kg_nodes = False
+                        
                         for graph_doc in graph_documents:
-                            # Check for both nodes and entities attributes
-                            nodes_to_process = []
+                            # Check if the graph document has nodes
                             if hasattr(graph_doc, 'nodes') and graph_doc.nodes:
-                                nodes_to_process.extend(graph_doc.nodes)
-                            if hasattr(graph_doc, 'entities') and graph_doc.entities:
-                                nodes_to_process.extend(graph_doc.entities)
-                            
-                            # Process all nodes/entities
-                            for node in nodes_to_process:
-                                # Create node with properties
-                                node_properties = {}
-                                for key, value in node.properties.items():
-                                    if isinstance(value, (str, int, float, bool)):
-                                        node_properties[key] = value
+                                for node in graph_doc.nodes:
+                                    # Create node with properties
+                                    node_properties = {}
+                                    if hasattr(node, 'properties'):
+                                        for key, value in node.properties.items():
+                                            if isinstance(value, (str, int, float, bool)):
+                                                node_properties[key] = value
                                 
-                                # Get node type
-                                node_type = getattr(node, 'type', getattr(node, 'entity_type', 'Entity'))
-                                
-                                # Create the node with its label
-                                session.run(f"""
-                                MERGE (n:`{node_type}` {{id: $id}})
-                                SET n += $properties
-                                """, id=node.id, properties=node_properties)
-                                
-                                # Connect to document
-                                session.run("""
-                                MATCH (d:Document {document_id: $doc_id})
-                                MATCH (n {id: $node_id})
-                                MERGE (d)-[:CONTAINS]->(n)
-                                """, doc_id=document_id, node_id=node.id)
+                                    # Get node type
+                                    node_type = node.type if hasattr(node, 'type') else "Entity"
+                                    
+                                    # Create the node with its label
+                                    session.run(f"""
+                                    MERGE (n:`{node_type}` {{id: $id}})
+                                    SET n += $properties
+                                    """, id=node.id, properties=node_properties)
+                                    
+                                    # Connect to document
+                                    session.run("""
+                                    MATCH (d:Document {document_id: $doc_id})
+                                    MATCH (n {id: $node_id})
+                                    MERGE (d)-[:CONTAINS]->(n)
+                                    """, doc_id=document_id, node_id=node.id)
+                                    created_kg_nodes = True
+                                graph_document_count += 1
                             
                             # Check if the graph document has relationships
                             if hasattr(graph_doc, 'relationships') and graph_doc.relationships:
-                                # Add relationships between entities
                                 for rel in graph_doc.relationships:
-                                    # Extract source and target IDs from Node objects
+                                    # Extract source and target IDs
                                     source_id = rel.source.id if hasattr(rel.source, 'id') else str(rel.source)
                                     target_id = rel.target.id if hasattr(rel.target, 'id') else str(rel.target)
                                     rel_type = rel.type
@@ -979,12 +1040,137 @@ class Neo4jDatabaseManager:
                                     MATCH (target {{id: $target_id}})
                                     MERGE (source)-[:`{rel_type}`]->(target)
                                     """, source_id=source_id, target_id=target_id)
-                            else:
-                                # Handle the case when graph document doesn't have expected structure
+                                    created_kg_nodes = True
+                                graph_document_count += 1
+                            
+                            # Only log the missing structure if both nodes and relationships are missing
+                            if (not hasattr(graph_doc, 'nodes') or not graph_doc.nodes) and (not hasattr(graph_doc, 'relationships') or not graph_doc.relationships):
                                 log_message(f"Graph document is missing expected structure. Creating only basic document node.")
-                    
-                    log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
-                    return True
+                        
+                        # If no nodes were created through the normal process, try a direct extraction from content
+                        if not created_kg_nodes:
+                            log_message("No knowledge graph nodes were created, attempting direct entity extraction fallback")
+                            try:
+                                # Direct entity extraction as fallback
+                                from langchain_openai import OpenAIEmbeddings
+                                from langchain_core.prompts import ChatPromptTemplate
+                                
+                                # Extract key entities from content
+                                entity_extraction_prompt = ChatPromptTemplate.from_template(
+                                    """Extract the main entities from the following text. 
+                                    For each entity, provide:
+                                    1. Entity name
+                                    2. Entity type (Person, Organization, Location, Concept, Technology, etc.)
+                                    3. Brief description
+                                    
+                                    Format as JSON with an array of objects with keys: name, type, description
+                                    
+                                    Text: {content}
+                                    
+                                    JSON:"""
+                                )
+                                
+                                entity_chain = entity_extraction_prompt | llm
+                                entity_json_str = entity_chain.invoke({"content": content})
+                                
+                                # Try to parse the JSON response
+                                import json
+                                import re
+                                
+                                # Extract JSON if it's wrapped in backticks or other formatting
+                                json_match = re.search(r'```json\s*([\s\S]*?)\s*```|```([\s\S]*?)```|(\{[\s\S]*\})', entity_json_str)
+                                if json_match:
+                                    json_str = json_match.group(1) or json_match.group(2) or json_match.group(3)
+                                    entity_data = json.loads(json_str)
+                                else:
+                                    entity_data = json.loads(entity_json_str)
+                                    
+                                # Create entity nodes
+                                entities_created = 0
+                                for entity in entity_data:
+                                    if isinstance(entity, dict) and 'name' in entity and 'type' in entity:
+                                        entity_name = entity['name']
+                                        entity_type = entity['type']
+                                        properties = {k: v for k, v in entity.items() if k not in ['name', 'type']}
+                                        
+                                        # Create the entity node
+                                        session.run(f"""
+                                        MERGE (n:`{entity_type}` {{id: $id}})
+                                        SET n += $properties
+                                        """, id=entity_name, properties=properties)
+                                        
+                                        # Connect to document
+                                        session.run("""
+                                        MATCH (d:Document {document_id: $doc_id})
+                                        MATCH (n {id: $entity_id})
+                                        MERGE (d)-[:CONTAINS]->(n)
+                                        """, doc_id=document_id, entity_id=entity_name)
+                                        entities_created += 1
+                                
+                                log_message(f"Created {entities_created} entity nodes using fallback extraction")
+                                
+                                # Now try to extract relationships between the created entities
+                                if entities_created > 1:
+                                    # Get the entity names that were created
+                                    entity_names = [entity['name'] for entity in entity_data if 'name' in entity]
+                                    
+                                    # Create a relationship extraction prompt
+                                    relationship_prompt = ChatPromptTemplate.from_template(
+                                        """Given the entities extracted from this text, identify the relationships between them.
+                                        
+                                        Text: {content}
+                                        
+                                        Entities: {entity_list}
+                                        
+                                        For each relationship, provide:
+                                        1. Source entity (must be from the entity list)
+                                        2. Relationship type (e.g., WORKS_FOR, KNOWS, RESEARCHES, etc.)
+                                        3. Target entity (must be from the entity list)
+                                        
+                                        Format as JSON with an array of objects with keys: source, type, target
+                                        
+                                        JSON:"""
+                                    )
+                                    
+                                    relationship_chain = relationship_prompt | llm
+                                    relationship_json_str = relationship_chain.invoke({
+                                        "content": content,
+                                        "entity_list": ", ".join(entity_names)
+                                    })
+                                    
+                                    # Try to parse the JSON response
+                                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```|```([\s\S]*?)```|(\{[\s\S]*\}|\[[\s\S]*\])', relationship_json_str)
+                                    if json_match:
+                                        json_str = json_match.group(1) or json_match.group(2) or json_match.group(3)
+                                        relationship_data = json.loads(json_str)
+                                    else:
+                                        relationship_data = json.loads(relationship_json_str)
+                                    
+                                    # Create relationships
+                                    relationships_created = 0
+                                    for rel in relationship_data:
+                                        if isinstance(rel, dict) and 'source' in rel and 'type' in rel and 'target' in rel:
+                                            source = rel['source']
+                                            rel_type = rel['type']
+                                            target = rel['target']
+                                            
+                                            # Create the relationship
+                                            session.run(f"""
+                                            MATCH (source {{id: $source_id}})
+                                            MATCH (target {{id: $target_id}})
+                                            MERGE (source)-[:`{rel_type}`]->(target)
+                                            """, source_id=source, target_id=target)
+                                            relationships_created += 1
+                                    
+                                    log_message(f"Created {relationships_created} relationships using fallback extraction")
+                                
+                                created_kg_nodes = entities_created > 0
+                            
+                            except Exception as fallback_err:
+                                log_message(f"Fallback entity extraction failed: {str(fallback_err)}", True)
+                        
+                        log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
+                        return True
                 except Exception as transform_err:
                     log_message(f"Error in graph transformation process: {str(transform_err)}", True)
                     log_message(traceback.format_exc(), True)
