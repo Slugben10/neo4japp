@@ -134,6 +134,26 @@ def get_app_path():
 # Set application path
 APP_PATH = get_app_path()
 
+# Function to load environment variables from .env file
+def load_env_variables():
+    """Load environment variables from .env file if it exists"""
+    env_path = os.path.join(APP_PATH, ".env")
+    try:
+        if os.path.exists(env_path):
+            log_message("Loading environment variables from .env file")
+            with open(env_path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#'):
+                        key, value = line.split('=', 1)
+                        os.environ[key.strip()] = value.strip()
+                        log_message(f"Loaded environment variable: {key.strip()}")
+    except Exception as e:
+        log_message(f"Error loading environment variables: {str(e)}", True)
+
+# Load environment variables at startup
+load_env_variables()
+
 # Add new imports for RAG/GraphRAG
 import time
 import hashlib
@@ -673,6 +693,28 @@ class Neo4jDatabaseManager:
                     )
                     
                     log_message(f"Found {len(results)} similar documents using vector search")
+                    
+                    # Apply priority sorting to the retrieved documents if running in an app context
+                    if hasattr(wx.GetApp(), 'document_priorities'):
+                        app = wx.GetApp()
+                        priority_values = {"High": 3, "Medium": 2, "Low": 1}
+                        
+                        # Add priority score to each document's metadata
+                        for doc in results:
+                            doc_id = doc.metadata.get("document_id", "")
+                            # Extract filename from the document_id if possible
+                            filename = os.path.basename(doc_id) if doc_id else ""
+                            # Get priority from app's priorities or default to Medium
+                            priority = app.document_priorities.get(filename, "Medium")
+                            priority_value = priority_values.get(priority, 2)
+                            doc.metadata["priority_value"] = priority_value
+                        
+                        # Sort by priority (higher first), then by similarity score
+                        results = sorted(results, 
+                                         key=lambda doc: (doc.metadata.get("priority_value", 2), 
+                                                         doc.metadata.get("score", 0.0)), 
+                                         reverse=True)
+                    
                     return results
                 except Exception as e:
                     log_message(f"Error querying vector store: {str(e)}", True)
@@ -721,6 +763,27 @@ class Neo4jDatabaseManager:
                             )
                             documents.append(doc)
                         
+                        # Apply priority sorting to the retrieved documents if running in an app context
+                        if hasattr(wx.GetApp(), 'document_priorities'):
+                            app = wx.GetApp()
+                            priority_values = {"High": 3, "Medium": 2, "Low": 1}
+                            
+                            # Add priority score to each document's metadata
+                            for doc in documents:
+                                doc_id = doc.metadata.get("document_id", "")
+                                # Extract filename from the document_id if possible
+                                filename = os.path.basename(doc_id) if doc_id else ""
+                                # Get priority from app's priorities or default to Medium
+                                priority = app.document_priorities.get(filename, "Medium")
+                                priority_value = priority_values.get(priority, 2)
+                                doc.metadata["priority_value"] = priority_value
+                            
+                            # Sort by priority (higher first), then by similarity score
+                            documents = sorted(documents, 
+                                             key=lambda doc: (doc.metadata.get("priority_value", 2), 
+                                                             doc.metadata.get("score", 0.0)), 
+                                             reverse=True)
+                        
                         log_message(f"Found {len(documents)} similar documents using graph search")
                         return documents
                     except Exception as e:
@@ -764,6 +827,27 @@ class Neo4jDatabaseManager:
                             metadata=metadata
                         )
                         documents.append(doc)
+                    
+                    # Apply priority sorting to the retrieved documents if running in an app context
+                    if hasattr(wx.GetApp(), 'document_priorities'):
+                        app = wx.GetApp()
+                        priority_values = {"High": 3, "Medium": 2, "Low": 1}
+                        
+                        # Add priority score to each document's metadata
+                        for doc in documents:
+                            doc_id = doc.metadata.get("document_id", "")
+                            # Extract filename from the document_id if possible
+                            filename = os.path.basename(doc_id) if doc_id else ""
+                            # Get priority from app's priorities or default to Medium
+                            priority = app.document_priorities.get(filename, "Medium")
+                            priority_value = priority_values.get(priority, 2)
+                            doc.metadata["priority_value"] = priority_value
+                        
+                        # Sort by priority (higher first), then by similarity score
+                        documents = sorted(documents, 
+                                         key=lambda doc: (doc.metadata.get("priority_value", 2), 
+                                                         doc.metadata.get("score", 0.0)), 
+                                         reverse=True)
                     
                     log_message(f"Found {len(documents)} documents using text search (fallback)")
                     return documents
@@ -2162,41 +2246,160 @@ class PromptLibraryDialog(wx.Dialog):
 
 class MessageEditDialog(wx.Dialog):
     def __init__(self, parent, message, title="Edit Message"):
-        super(MessageEditDialog, self).__init__(parent, title=title, size=(500, 300))
+        super(MessageEditDialog, self).__init__(
+            parent, title=title, size=(700, 500)
+        )
         
-        # Create a panel and sizer
-        panel = wx.Panel(self)
-        sizer = wx.BoxSizer(wx.VERTICAL)
+        # Create main sizer
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
         
-        # Add message text control
-        self.text_ctrl = wx.TextCtrl(panel, value=message, style=wx.TE_MULTILINE)
-        sizer.Add(self.text_ctrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+        # Message text control
+        self.message_ctrl = wx.TextCtrl(
+            self, style=wx.TE_MULTILINE | wx.TE_RICH2
+        )
+        self.message_ctrl.SetValue(message)
+        main_sizer.Add(self.message_ctrl, 1, wx.EXPAND | wx.ALL, 10)
         
-        # Add buttons
-        btn_sizer = wx.StdDialogButtonSizer()
-        save_btn = wx.Button(panel, wx.ID_OK, "Save")
-        cancel_btn = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        # Buttons
+        button_sizer = wx.StdDialogButtonSizer()
         
-        btn_sizer.AddButton(save_btn)
-        btn_sizer.AddButton(cancel_btn)
-        btn_sizer.Realize()
+        self.save_button = wx.Button(self, wx.ID_OK, "Save")
+        self.save_button.Bind(wx.EVT_BUTTON, self.on_save)
+        button_sizer.AddButton(self.save_button)
         
-        sizer.Add(btn_sizer, 0, wx.ALIGN_CENTER | wx.ALL, 10)
+        self.cancel_button = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        button_sizer.AddButton(self.cancel_button)
         
-        # Set the sizer
-        panel.SetSizer(sizer)
+        button_sizer.Realize()
+        main_sizer.Add(button_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
         
-        # Bind events
-        save_btn.Bind(wx.EVT_BUTTON, self.on_save)
-        
-        # Center the dialog
-        self.Centre()
+        self.SetSizer(main_sizer)
         
     def on_save(self, event):
-        event.Skip()
+        self.EndModal(wx.ID_OK)
         
     def GetMessage(self):
-        return self.text_ctrl.GetValue()
+        return self.message_ctrl.GetValue()
+
+# Settings Dialog for API Keys
+class SettingsDialog(wx.Dialog):
+    def __init__(self, parent, config):
+        super(SettingsDialog, self).__init__(
+            parent, title="Settings", size=(500, 500),
+            style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER
+        )
+        
+        self.config = config
+        self.api_keys = {}
+        
+        # Load existing API keys from environment
+        for model_key, model_config in self.config.get("models", {}).items():
+            api_key_env = model_config.get("api_key_env", "")
+            if api_key_env:
+                self.api_keys[model_key] = os.environ.get(api_key_env, "")
+        
+        # Create main panel and sizer
+        panel = wx.Panel(self)
+        main_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Title
+        title_text = wx.StaticText(panel, label="API Key Configuration")
+        font = title_text.GetFont()
+        font.SetPointSize(12)
+        font.SetWeight(wx.FONTWEIGHT_BOLD)
+        title_text.SetFont(font)
+        main_sizer.Add(title_text, 0, wx.ALL, 10)
+        
+        # Description
+        description = wx.StaticText(panel, label="Enter your API keys for the following models:")
+        main_sizer.Add(description, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        
+        # Create a scrolled window for API key inputs
+        scroll_window = wx.ScrolledWindow(panel, style=wx.VSCROLL)
+        scroll_window.SetScrollRate(0, 10)
+        scroll_sizer = wx.BoxSizer(wx.VERTICAL)
+        
+        # Add API key input fields
+        self.api_key_ctrls = {}
+        
+        for model_key, model_config in sorted(self.config.get("models", {}).items()):
+            if "api_key_env" in model_config:
+                # Create a panel for this model
+                model_panel = wx.Panel(scroll_window)
+                model_sizer = wx.BoxSizer(wx.VERTICAL)
+                
+                # Model name label
+                model_name = model_config.get("name", model_key)
+                label = wx.StaticText(model_panel, label=f"{model_name} API Key:")
+                model_sizer.Add(label, 0, wx.BOTTOM, 5)
+                
+                # API key input field
+                api_key_ctrl = wx.TextCtrl(model_panel, style=wx.TE_PASSWORD)
+                if model_key in self.api_keys:
+                    api_key_ctrl.SetValue(self.api_keys[model_key])
+                model_sizer.Add(api_key_ctrl, 0, wx.EXPAND | wx.BOTTOM, 10)
+                
+                # Environment variable name
+                env_name = model_config.get("api_key_env", "")
+                env_label = wx.StaticText(model_panel, label=f"Environment Variable: {env_name}")
+                font = env_label.GetFont()
+                font.SetPointSize(8)
+                env_label.SetFont(font)
+                model_sizer.Add(env_label, 0, wx.BOTTOM, 15)
+                
+                model_panel.SetSizer(model_sizer)
+                scroll_sizer.Add(model_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+                
+                # Store reference to the control
+                self.api_key_ctrls[model_key] = api_key_ctrl
+        
+        scroll_window.SetSizer(scroll_sizer)
+        main_sizer.Add(scroll_window, 1, wx.EXPAND | wx.ALL, 10)
+        
+        # Buttons
+        button_sizer = wx.StdDialogButtonSizer()
+        
+        self.save_button = wx.Button(panel, wx.ID_OK, "Save Settings")
+        self.save_button.Bind(wx.EVT_BUTTON, self.on_save)
+        button_sizer.AddButton(self.save_button)
+        
+        self.cancel_button = wx.Button(panel, wx.ID_CANCEL, "Cancel")
+        button_sizer.AddButton(self.cancel_button)
+        
+        button_sizer.Realize()
+        main_sizer.Add(button_sizer, 0, wx.ALIGN_RIGHT | wx.ALL, 10)
+        
+        panel.SetSizer(main_sizer)
+        
+        # Set minimum size
+        self.SetMinSize(wx.Size(400, 300))
+    
+    def on_save(self, event):
+        # Save API keys to environment variables
+        for model_key, api_key_ctrl in self.api_key_ctrls.items():
+            api_key = api_key_ctrl.GetValue().strip()
+            if model_key in self.config.get("models", {}):
+                api_key_env = self.config["models"][model_key].get("api_key_env", "")
+                if api_key_env and api_key:
+                    os.environ[api_key_env] = api_key
+                    log_message(f"Updated API key for {model_key}")
+        
+        # Create a .env file to store the API keys persistently
+        try:
+            env_path = os.path.join(APP_PATH, ".env")
+            with open(env_path, 'w') as f:
+                for model_key, api_key_ctrl in self.api_key_ctrls.items():
+                    api_key = api_key_ctrl.GetValue().strip()
+                    if model_key in self.config.get("models", {}):
+                        api_key_env = self.config["models"][model_key].get("api_key_env", "")
+                        if api_key_env and api_key:
+                            f.write(f"{api_key_env}={api_key}\n")
+            
+            log_message("API keys saved to .env file")
+        except Exception as e:
+            log_message(f"Error saving API keys to .env file: {str(e)}", True)
+        
+        self.EndModal(wx.ID_OK)
 
 # Main application class
 class ResearchAssistantApp(wx.Frame):
@@ -2878,6 +3081,12 @@ class ResearchAssistantApp(wx.Frame):
                 self.model_choice.SetStringSelection(default_model_name)
             model_sizer.Add(self.model_choice, 1, wx.EXPAND)
             
+            # Add settings button
+            settings_btn = wx.Button(model_panel, label="Settings")
+            settings_btn.SetToolTip("Configure API keys and other settings")
+            settings_btn.Bind(wx.EVT_BUTTON, self.on_open_settings)
+            model_sizer.Add(settings_btn, 0, wx.LEFT, 5)
+            
             model_panel.SetSizer(model_sizer)
             right_sizer.Add(model_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
             
@@ -3477,27 +3686,30 @@ class ResearchAssistantApp(wx.Frame):
             )
     
     def on_load_prompt(self, event):
-        """Handle loading a prompt from the library"""
+        # Open prompt library dialog in load mode
+        dialog = PromptLibraryDialog(self, mode="load")
+        if dialog.ShowModal() == wx.ID_OK:
+            prompt_content = dialog.get_prompt_content()
+            if prompt_content:
+                self.user_input.SetValue(prompt_content)
+        dialog.Destroy()
+        
+    def on_open_settings(self, event):
+        """Open the settings dialog"""
         try:
-            # Show the dialog
-            dialog = PromptLibraryDialog(self, mode="load")
-            result = dialog.ShowModal()
-            
-            if result == wx.ID_OK:
-                # Get the selected prompt content
-                prompt_content = dialog.get_prompt_content()
-                if prompt_content:
-                    # Set the input text to the prompt content
-                    self.user_input.SetValue(prompt_content)
-                    log_message("Prompt loaded")
-            
+            dialog = SettingsDialog(self, self.config)
+            if dialog.ShowModal() == wx.ID_OK:
+                # Refresh the UI or apply changes as needed
+                log_message("Settings saved successfully")
+                
+                # Optionally reload environment variables to ensure they're available
+                load_env_variables()
             dialog.Destroy()
         except Exception as e:
-            log_message(f"Error loading prompt: {str(e)}", True)
-            log_message(traceback.format_exc(), True)
+            log_message(f"Error opening settings dialog: {str(e)}", True)
             wx.MessageBox(
-                f"Error loading prompt:\n{str(e)}",
-                "Load Error",
+                f"Error opening settings dialog: {str(e)}",
+                "Settings Error",
                 wx.OK | wx.ICON_ERROR
             )
     
@@ -4379,16 +4591,29 @@ def create_rag_chain(neo4j_manager, llm_client):
                 doc_id = doc.metadata.get("document_id", "unknown")
                 if doc_id not in unique_docs:
                     unique_docs[doc_id] = doc
+                # If we already have this document but the current one has higher priority, replace it
+                elif doc.metadata.get("priority_value", 0) > unique_docs[doc_id].metadata.get("priority_value", 0):
+                    unique_docs[doc_id] = doc
             
             # Get the final list of documents
             relevant_docs = list(unique_docs.values())
+            
+            # Sort final list by priority value
+            relevant_docs = sorted(relevant_docs, 
+                                   key=lambda doc: doc.metadata.get("priority_value", 2),
+                                   reverse=True)
             
             # Log the retrieved documents for debugging
             log_message(f"Retrieved {len(relevant_docs)} total unique documents:")
             for doc in relevant_docs:
                 doc_id = doc.metadata.get("document_id", "unknown")
                 title = doc.metadata.get("title", "Untitled")
-                log_message(f"  - Document '{title}' (ID: {doc_id})")
+                priority = "Unknown"
+                if hasattr(wx.GetApp(), 'document_priorities'):
+                    app = wx.GetApp()
+                    filename = os.path.basename(doc_id) if doc_id else ""
+                    priority = app.document_priorities.get(filename, "Medium")
+                log_message(f"  - Document '{title}' (ID: {doc_id}, Priority: {priority})")
             
             if not relevant_docs:
                 return "No relevant information found in the database for this query. Please try rephrasing or ask a different question."
