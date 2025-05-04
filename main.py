@@ -388,7 +388,7 @@ class Neo4jDatabaseManager:
                                 norm + $query_embedding[i] * $query_embedding[i]))) AS score
                         ORDER BY score DESC 
                         LIMIT $k
-                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, score
+                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, score
                         """, query_embedding=query_embedding, k=k)
                         
                         # Convert results to Document objects
@@ -398,7 +398,8 @@ class Neo4jDatabaseManager:
                             metadata = {
                                 "document_id": record["document_id"],
                                 "title": record["title"],
-                                "score": record["score"]
+                                "score": record["score"],
+                                "priority": record["priority"] if record["priority"] is not None else "Medium"
                             }
                             
                             # Create Document object
@@ -504,8 +505,10 @@ class Neo4jDatabaseManager:
                 MERGE (d:Document {document_id: $doc_id})
                 SET d.title = $title,
                     d.content = $content,
+                    d.priority = $priority,
                     d.updated_at = datetime()
-                """, doc_id=document_id, title=title, content=content)
+                """, doc_id=document_id, title=title, content=content, 
+                    priority=safe_metadata.get("priority", "Medium"))
                 
                 # Add metadata as separate properties, not as a nested object
                 if safe_metadata:
@@ -701,13 +704,19 @@ class Neo4jDatabaseManager:
                         
                         # Add priority score to each document's metadata
                         for doc in results:
-                            doc_id = doc.metadata.get("document_id", "")
-                            # Extract filename from the document_id if possible
-                            filename = os.path.basename(doc_id) if doc_id else ""
-                            # Get priority from app's priorities or default to Medium
-                            priority = app.document_priorities.get(filename, "Medium")
+                            # First check if priority is already in the metadata (from database)
+                            if "priority" in doc.metadata:
+                                priority = doc.metadata["priority"]
+                            else:
+                                # Get the title from metadata which should be the filename
+                                title = doc.metadata.get("title", "")
+                                
+                                # Get priority from app's priorities or default to Medium
+                                priority = app.document_priorities.get(title, "Medium")
+                            
                             priority_value = priority_values.get(priority, 2)
                             doc.metadata["priority_value"] = priority_value
+                            doc.metadata["priority"] = priority
                         
                         # Sort by priority (higher first), then by similarity score
                         results = sorted(results, 
@@ -730,7 +739,7 @@ class Neo4jDatabaseManager:
                         result = session.run("""
                         MATCH (d:Document)
                         WHERE d.document_id <> 'placeholder'
-                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
+                        RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, 1 AS score
                         LIMIT $limit
                         """, limit=limit)
                         
@@ -753,6 +762,7 @@ class Neo4jDatabaseManager:
                                 "document_id": record["document_id"],
                                 "title": record["title"],
                                 "score": record["score"],
+                                "priority": record["priority"] if record["priority"] is not None else "Medium",
                                 "source": "graph_search"
                             }
                             
@@ -770,13 +780,19 @@ class Neo4jDatabaseManager:
                             
                             # Add priority score to each document's metadata
                             for doc in documents:
-                                doc_id = doc.metadata.get("document_id", "")
-                                # Extract filename from the document_id if possible
-                                filename = os.path.basename(doc_id) if doc_id else ""
-                                # Get priority from app's priorities or default to Medium
-                                priority = app.document_priorities.get(filename, "Medium")
+                                # First check if priority is already in the metadata (from database)
+                                if "priority" in doc.metadata:
+                                    priority = doc.metadata["priority"]
+                                else:
+                                    # Get the title from metadata which should be the filename
+                                    title = doc.metadata.get("title", "")
+                                    
+                                    # Get priority from app's priorities or default to Medium
+                                    priority = app.document_priorities.get(title, "Medium")
+                                
                                 priority_value = priority_values.get(priority, 2)
                                 doc.metadata["priority_value"] = priority_value
+                                doc.metadata["priority"] = priority
                             
                             # Sort by priority (higher first), then by similarity score
                             documents = sorted(documents, 
@@ -795,7 +811,7 @@ class Neo4jDatabaseManager:
                     result = session.run("""
                     MATCH (d:Document)
                     WHERE d.document_id <> 'placeholder' AND toLower(d.content) CONTAINS toLower($query)
-                    RETURN d.content AS content, d.title AS title, d.document_id AS document_id, 1 AS score
+                    RETURN d.content AS content, d.title AS title, d.document_id AS document_id, d.priority AS priority, 1 AS score
                     LIMIT $limit
                     """, query=query, limit=limit)
                     
@@ -818,6 +834,7 @@ class Neo4jDatabaseManager:
                             "document_id": record["document_id"],
                             "title": record["title"],
                             "score": record["score"],
+                            "priority": record["priority"] if record["priority"] is not None else "Medium",
                             "source": "text_search"
                         }
                         
@@ -835,13 +852,19 @@ class Neo4jDatabaseManager:
                         
                         # Add priority score to each document's metadata
                         for doc in documents:
-                            doc_id = doc.metadata.get("document_id", "")
-                            # Extract filename from the document_id if possible
-                            filename = os.path.basename(doc_id) if doc_id else ""
-                            # Get priority from app's priorities or default to Medium
-                            priority = app.document_priorities.get(filename, "Medium")
+                            # First check if priority is already in the metadata (from database)
+                            if "priority" in doc.metadata:
+                                priority = doc.metadata["priority"]
+                            else:
+                                # Get the title from metadata which should be the filename
+                                title = doc.metadata.get("title", "")
+                                
+                                # Get priority from app's priorities or default to Medium
+                                priority = app.document_priorities.get(title, "Medium")
+                            
                             priority_value = priority_values.get(priority, 2)
                             doc.metadata["priority_value"] = priority_value
+                            doc.metadata["priority"] = priority
                         
                         # Sort by priority (higher first), then by similarity score
                         documents = sorted(documents, 
@@ -3433,7 +3456,11 @@ class ResearchAssistantApp(wx.Frame):
                     document_id=doc_id,
                     title=filename,
                     content=content,
-                    metadata={"filename": filename, "file_type": file_extension[1:] if file_extension else "unknown"}
+                    metadata={
+                        "filename": filename, 
+                        "file_type": file_extension[1:] if file_extension else "unknown",
+                        "priority": self.document_priorities.get(filename, "Medium")
+                    }
                 )
                 
                 if success:
@@ -4600,23 +4627,20 @@ def create_rag_chain(neo4j_manager, llm_client):
             
             # Sort final list by priority value
             relevant_docs = sorted(relevant_docs, 
-                                   key=lambda doc: doc.metadata.get("priority_value", 2),
-                                   reverse=True)
+                                key=lambda doc: doc.metadata.get("priority_value", 2),
+                                reverse=True)
             
-            # Log the retrieved documents for debugging
+            # Log information about the retrieved documents
             log_message(f"Retrieved {len(relevant_docs)} total unique documents:")
             for doc in relevant_docs:
                 doc_id = doc.metadata.get("document_id", "unknown")
                 title = doc.metadata.get("title", "Untitled")
-                priority = "Unknown"
-                if hasattr(wx.GetApp(), 'document_priorities'):
-                    app = wx.GetApp()
-                    filename = os.path.basename(doc_id) if doc_id else ""
-                    priority = app.document_priorities.get(filename, "Medium")
+                priority = doc.metadata.get("priority", "Medium")
                 log_message(f"  - Document '{title}' (ID: {doc_id}, Priority: {priority})")
             
+            # If no documents were found, return a simple response
             if not relevant_docs:
-                return "No relevant information found in the database for this query. Please try rephrasing or ask a different question."
+                return "I couldn't find any relevant information in the database for your query. Please try a different question or add more documents to the database."
                 
             # Format context string from documents
             context_parts = []
