@@ -2427,8 +2427,33 @@ class SettingsDialog(wx.Dialog):
 # Main application class
 class ResearchAssistantApp(wx.Frame):
     def __init__(self):
-        """Initialize the application"""
-        super().__init__(None, title="Neo4j Research Assistant", size=(1200, 800))
+        super(ResearchAssistantApp, self).__init__(
+            None, title="Neo4j Research Assistant", 
+            size=(1200, 800)
+        )
+        
+        # Initialize application state
+        self.conversation_history = []
+        self.documents = {}  # Filename -> Content
+        self.document_priorities = {}  # Filename -> Priority (High, Medium, Low)
+        self.message_positions = []
+        self.db_initialized = False
+        self.neo4j_manager = None
+        self.neo4j_server = None
+        self.rag_chain = None
+        
+        # Initialize streaming state
+        self.current_streaming_response = None
+        
+        # Create and bind custom event types
+        global StreamEvent
+        StreamEvent, EVT_STREAM = wx.lib.newevent.NewEvent()
+        self.Bind(EVT_STREAM, self.on_stream_event)
+        
+        # Create and bind custom database initialized event
+        global DbInitEvent
+        DbInitEvent, EVT_DB_INIT = wx.lib.newevent.NewEvent()
+        self.Bind(EVT_DB_INIT, self.on_db_init_event)
         
         # Application path
         self.base_path = APP_PATH
@@ -2437,19 +2462,8 @@ class ResearchAssistantApp(wx.Frame):
         self.config = load_config() or create_default_config()
         
         # Initialize member variables
-        self.documents = {}
-        self.document_priorities = {}
-        self.conversation_history = []
-        self.current_conversation_path = None
         self.conversation_dirty = False
-        self.neo4j_server = EmbeddedNeo4jServer(base_path=self.base_path)
-        self.neo4j_manager = None
-        self.db_initialized = False
-        self.message_positions = []  # To keep track of message positions for editing
-        self.rag_chain = None
-        self.graph_chain = None
         self.showing_loader = False
-        self.current_streaming_response = None
         
         # Setup UI
         self.setup_ui()
@@ -3891,17 +3905,62 @@ class ResearchAssistantApp(wx.Frame):
             # Create a system prompt with conversation context (shortened version)
             system_prompt = self.config.get("system_prompt", "You are a helpful research assistant.")
             
-            # Build a clean prompt with just the current message to avoid context issues
-            full_prompt = f"{system_prompt}\n\nUser: {message_content}\n\nAssistant:"
-            
             # Process streaming response
             response_chunks = []
             
             # Define the callback for streaming updates
             def update_response_callback(chunk):
                 # Post event to main thread for UI update
-                evt = StreamEvent(text=chunk)
-                wx.PostEvent(self, evt)
+                # Make sure we're passing a string to the StreamEvent
+                if isinstance(chunk, str):
+                    evt = StreamEvent(text=chunk)
+                    wx.PostEvent(self, evt)
+                else:
+                    # If not a string, convert it
+                    evt = StreamEvent(text=str(chunk))
+                    wx.PostEvent(self, evt)
+            
+            # Check if RAG is enabled - mirroring the process_message function logic
+            if hasattr(self, 'rag_toggle') and self.rag_toggle.GetValue():
+                if self.rag_chain:
+                    log_message("Using RAG for edited message response")
+                    try:
+                        # For RAG responses, we need to use streaming if available
+                        # or explicitly handle the response
+                        response = self.rag_chain(message_content)
+                        # If it's not a streaming response, manually handle it
+                        wx.CallAfter(self.handle_edited_response, response)
+                        return
+                    except Exception as rag_error:
+                        log_message(f"Error using RAG chain: {str(rag_error)}", True)
+                        # Fall back to direct query if RAG fails
+            
+            # If RAG isn't enabled or failed, use document context approach
+            # Get selected documents
+            selected_docs = []
+            for child in self.doc_panel.GetChildren():
+                for grandchild in child.GetChildren():
+                    if isinstance(grandchild, wx.CheckBox) and grandchild.GetValue():
+                        filename = grandchild.GetLabel()
+                        if filename in self.documents:
+                            content = self.documents[filename]
+                            # Get priority and sort accordingly
+                            priority = self.document_priorities.get(filename, "Medium")
+                            priority_value = {"High": 3, "Medium": 2, "Low": 1}.get(priority, 2)
+                            selected_docs.append((filename, content, priority_value))
+            
+            # Sort docs by priority (highest first)
+            selected_docs.sort(key=lambda x: x[2], reverse=True)
+            
+            # Build document context
+            doc_context = ""
+            if selected_docs:
+                doc_context = "Here are the relevant documents:\n\n"
+                for filename, content, _ in selected_docs:
+                    doc_context += f"[{filename}]\n{content}\n\n"
+            
+            # Build full prompt with document context
+            full_prompt = f"{system_prompt}\n\n{doc_context}User: {message_content}\n\nAssistant: I'll combine information from the documents with my knowledge to give you the most helpful answer."
             
             # Try to process with the appropriate model
             try:
@@ -3930,12 +3989,25 @@ class ResearchAssistantApp(wx.Frame):
     def handle_edited_response(self, response):
         """Handle the response from the language model after an edit"""
         try:
-            # Only append if it's not already a streaming response
-            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
+            # Handle AIMessage objects from LangChain
+            if hasattr(response, 'content') and callable(getattr(response, 'content', None)):
+                # This is for older versions of langchain
+                response = response.content()
+            elif hasattr(response, 'content') and not callable(getattr(response, 'content', None)):
+                # This is for newer versions of langchain
+                response = response.content
+                
+            # Only append to chat if it's not already displayed via streaming
+            already_streamed = (hasattr(self, 'current_streaming_response') and 
+                               self.current_streaming_response is not None and 
+                               self.current_streaming_response != "")
+            
+            if not already_streamed:
+                # No streaming happened, so we need to add the full response
                 self.append_to_chat(response, "Assistant")
-            else:
-                # Reset streaming state
-                self.current_streaming_response = None
+                
+            # Reset streaming state regardless
+            self.current_streaming_response = None
             
             # Add to conversation history
             self.conversation_history.append({"role": "assistant", "content": response})
@@ -3944,9 +4016,13 @@ class ResearchAssistantApp(wx.Frame):
             self.user_input.Enable()
             self.SetStatusText("Message edited successfully")
             
+            # Log completion of edit
+            log_message("Edited message response handled successfully")
+            
         except Exception as e:
             error_msg = f"Error handling edited response: {str(e)}"
             log_message(error_msg, True)
+            log_message(traceback.format_exc(), True)
             self.handle_edit_error(error_msg)
     
     def handle_edit_error(self, error_msg):
@@ -4048,10 +4124,22 @@ class ResearchAssistantApp(wx.Frame):
             self.user_input.Enable()
 
     def on_stream_event(self, event):
-        # Append the chunk to the chat display
-        self.append_streaming_chunk(event.text)
-        # Add to the current streaming response
-        self.current_streaming_response += event.text
+        """Handle streaming chunks, including those from edited messages"""
+        try:
+            # Append the chunk to the chat display
+            self.append_streaming_chunk(event.text)
+            
+            # Add to the current streaming response
+            if hasattr(self, 'current_streaming_response'):
+                self.current_streaming_response += event.text
+            else:
+                self.current_streaming_response = event.text
+                
+            # Ensure UI is updated immediately
+            wx.GetApp().Yield()
+        except Exception as e:
+            log_message(f"Error handling stream event: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
     
     def append_to_chat(self, message, sender):
         """Append a message to the chat display"""
@@ -4102,9 +4190,14 @@ class ResearchAssistantApp(wx.Frame):
                 # This is for newer versions of langchain
                 chunk = chunk.content
             
+            # Ensure chunk is a string
+            chunk = str(chunk)
+            
             # If this is the first chunk, add a new message
-            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None:
-                self.current_streaming_response = ""
+            if not hasattr(self, 'current_streaming_response') or self.current_streaming_response is None or self.current_streaming_response == "":
+                # Init streaming container if needed
+                if not hasattr(self, 'current_streaming_response'):
+                    self.current_streaming_response = ""
                 
                 # Add a new message from the assistant
                 current_position = len(self.chat_display.GetValue())
@@ -4120,12 +4213,16 @@ class ResearchAssistantApp(wx.Frame):
                 self.message_positions.append(current_position)
             
             # Append the new chunk
-            self.chat_display.AppendText(str(chunk))
+            self.chat_display.AppendText(chunk)
             
             # Scroll to the bottom
             self.chat_display.ShowPosition(self.chat_display.GetLastPosition())
+            
+            # Force UI update
+            wx.GetApp().Yield()
         except Exception as e:
             log_message(f"Error appending streaming chunk: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
     
     def get_llm_client(self):
         """Get the LLM client based on the selected model"""
