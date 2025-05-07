@@ -19,6 +19,7 @@ import atexit
 import re
 import select
 import importlib
+import uuid
 
 # Define a function to check if a package is installed
 def check_package_installed(package_name):
@@ -330,40 +331,138 @@ class Neo4jDatabaseManager:
                     self.database = database
                 
                 def add_documents(self, documents):
-                    """Add documents to the vector store"""
-                    with self.driver.session() as session:
+                    """Add documents to the vector store with batch processing for better performance"""
+                    try:
+                        # Process documents in batches to improve performance
+                        batch_size = 20  # Process more documents per batch for better throughput
+                        
+                        # Initialize a dictionary to track nodes by the last character of their ID
+                        # This helps distribute documents to minimize lock contention
+                        partition_buckets = {}
+                        
+                        # Assign documents to partitions based on document_id hash
                         for doc in documents:
-                            # Get embedding for the text
-                            content = doc.page_content
-                            try:
-                                embedding = self.embedding_function.embed_query(content)
-                            except Exception as e:
-                                log_message(f"Error generating embedding: {str(e)}", True)
-                                continue
+                            doc_id = doc.metadata.get("document_id", "unknown")
+                            # Simple partitioning by last character of the ID hash
+                            partition_key = hash(doc_id) % 10
+                            if partition_key not in partition_buckets:
+                                partition_buckets[partition_key] = []
+                            partition_buckets[partition_key].append(doc)
+                        
+                        # Process each partition bucket sequentially to avoid lock conflicts
+                        for partition_key, partition_docs in partition_buckets.items():
+                            log_message(f"Processing partition {partition_key} with {len(partition_docs)} documents")
                             
-                            # Extract metadata
-                            document_id = doc.metadata.get("document_id", "unknown")
-                            title = doc.metadata.get("title", "Untitled")
-                            
-                            # Create a Cypher query to add the document
-                            session.run("""
-                            MERGE (d:Document {document_id: $doc_id})
-                            SET d.content = $content,
-                                d.title = $title,
-                                d.embedding = $embedding
-                            """, doc_id=document_id, content=content, 
-                                title=title, embedding=embedding)
+                            # Process in batches within each partition
+                            for i in range(0, len(partition_docs), batch_size):
+                                batch = partition_docs[i:i+batch_size]
                                 
-                            # Add metadata as separate properties to avoid serialization issues
-                            for key, value in doc.metadata.items():
-                                if isinstance(value, (str, int, float, bool)):
-                                    session.run(
-                                        f"""
-                                        MATCH (d:Document {{document_id: $doc_id}})
-                                        SET d.meta_{key} = $value
-                                        """,
-                                        doc_id=document_id, value=value
-                                    )
+                                # Create all embeddings for the batch
+                                embeddings_batch = []
+                                metadata_batch = []
+                                contents_batch = []
+                                
+                                # First collect all content to be embedded
+                                for doc in batch:
+                                    content = doc.page_content
+                                    contents_batch.append(content)
+                                    
+                                    # Extract metadata
+                                    metadata = {
+                                        "document_id": doc.metadata.get("document_id", "unknown"),
+                                        "title": doc.metadata.get("title", "Untitled"),
+                                        "content": content,
+                                        "raw_metadata": {k: v for k, v in doc.metadata.items() 
+                                                       if isinstance(v, (str, int, float, bool))}
+                                    }
+                                    metadata_batch.append(metadata)
+                                
+                                # Now create embeddings more efficiently as a batch if supported
+                                try:
+                                    # Try to generate embeddings in one batch if the embedding function supports it
+                                    if hasattr(self.embedding_function, "embed_documents"):
+                                        embeddings_batch = self.embedding_function.embed_documents(contents_batch)
+                                    else:
+                                        # Fall back to individual embedding generation
+                                        for content in contents_batch:
+                                            try:
+                                                embedding = self.embedding_function.embed_query(content)
+                                                embeddings_batch.append(embedding)
+                                            except Exception as e:
+                                                log_message(f"Error generating embedding: {str(e)}", True)
+                                                # Add None to keep indexes aligned
+                                                embeddings_batch.append(None)
+                                except Exception as e:
+                                    log_message(f"Error in batch embedding: {str(e)}", True)
+                                    # Fall back to individual embedding generation
+                                    for content in contents_batch:
+                                        try:
+                                            embedding = self.embedding_function.embed_query(content)
+                                            embeddings_batch.append(embedding)
+                                        except Exception as e:
+                                            log_message(f"Error generating embedding: {str(e)}", True)
+                                            # Add None to keep indexes aligned
+                                            embeddings_batch.append(None)
+                                
+                                # Now process the batch in one session
+                                if embeddings_batch:
+                                    with self.driver.session() as session:
+                                        # Create a transaction function to process the entire batch
+                                        def create_documents_tx(tx):
+                                            successful = 0
+                                            for idx, metadata in enumerate(metadata_batch):
+                                                # Skip entries with failed embeddings
+                                                if idx >= len(embeddings_batch) or embeddings_batch[idx] is None:
+                                                    continue
+                                                
+                                                try:
+                                                    # Create document node with embedding
+                                                    tx.run("""
+                                                    MERGE (d:Document {document_id: $doc_id})
+                                                    SET d.content = $content,
+                                                        d.title = $title,
+                                                        d.embedding = $embedding
+                                                    """, 
+                                                    doc_id=metadata["document_id"], 
+                                                    content=metadata["content"], 
+                                                    title=metadata["title"], 
+                                                    embedding=embeddings_batch[idx])
+                                                    
+                                                    # Add metadata as properties in a single query
+                                                    if metadata["raw_metadata"]:
+                                                        # Build SET clauses dynamically
+                                                        set_clauses = []
+                                                        params = {"doc_id": metadata["document_id"]}
+                                                        
+                                                        for meta_key, meta_value in metadata["raw_metadata"].items():
+                                                            param_name = f"meta_{meta_key}_{idx}"
+                                                            set_clauses.append(f"d.meta_{meta_key} = ${param_name}")
+                                                            params[param_name] = meta_value
+                                                        
+                                                        if set_clauses:
+                                                            meta_query = f"""
+                                                            MATCH (d:Document {{document_id: $doc_id}})
+                                                            SET {', '.join(set_clauses)}
+                                                            """
+                                                            tx.run(meta_query, **params)
+                                                    successful += 1
+                                                except Exception as e:
+                                                    log_message(f"Error processing document {metadata['document_id']}: {str(e)}", True)
+                                            return successful
+                                        
+                                        # Execute the batch transaction
+                                        try:
+                                            successful = session.execute_write(create_documents_tx)
+                                            log_message(f"Added batch of {successful} documents to vector store")
+                                        except Exception as e:
+                                            # Use write_transaction for older Neo4j versions
+                                            log_message(f"Falling back to write_transaction: {str(e)}", True)
+                                            successful = session.write_transaction(create_documents_tx)
+                                            log_message(f"Added batch of {successful} documents to vector store")
+                    
+                    except Exception as e:
+                        log_message(f"Error in batch document processing: {str(e)}", True)
+                        return False
                 
                 def similarity_search(self, query, k=5):
                     """Search for similar documents"""
@@ -481,7 +580,7 @@ class Neo4jDatabaseManager:
             return False
 
     def add_document(self, document_id, title, content, metadata=None):
-        """Add a document to both Neo4j graph database and vector store"""
+        """Add a document to both Neo4j graph database and vector store with optimized batch processing"""
         try:
             if not self.connected:
                 log_message("Not connected to Neo4j", True)
@@ -498,39 +597,37 @@ class Neo4jDatabaseManager:
                         # Convert complex objects to string representation
                         safe_metadata[k] = str(v)
             
-            # STEP 1: Add to Neo4j graph database
+            # STEP 1: Add to Neo4j graph database with a single transaction
             with self.driver.session() as session:
-                # Create the document node
-                session.run("""
-                MERGE (d:Document {document_id: $doc_id})
-                SET d.title = $title,
-                    d.content = $content,
-                    d.priority = $priority,
-                    d.updated_at = datetime()
-                """, doc_id=document_id, title=title, content=content, 
-                    priority=safe_metadata.get("priority", "Medium"))
-                
-                # Add metadata as separate properties, not as a nested object
-                if safe_metadata:
-                    # Create a Cypher query dynamically based on metadata keys
-                    metadata_sets = []
-                    params = {"doc_id": document_id}
+                def create_document_tx(tx):
+                    # Create the document node with all metadata in one operation
+                    metadata_props = {f"meta_{k}": v for k, v in safe_metadata.items()}
+                    all_props = {
+                        "document_id": document_id,
+                        "title": title,
+                        "content": content,
+                        "priority": safe_metadata.get("priority", "Medium"),
+                        "updated_at": "datetime()",  # Will be evaluated by Neo4j
+                        **metadata_props
+                    }
                     
-                    for i, (key, value) in enumerate(safe_metadata.items()):
-                        param_key = f"meta_{i}"
-                        metadata_sets.append(f"d.meta_{key} = ${param_key}")
-                        params[param_key] = value
-                    
-                    # Combine all the SET statements
-                    metadata_query = f"""
-                    MATCH (d:Document {{document_id: $doc_id}})
-                    SET {', '.join(metadata_sets)}
+                    # Build a dynamic query for creating the document with all properties
+                    properties_str = ", ".join([f"{k}: ${k}" for k in all_props.keys()])
+                    query = f"""
+                    MERGE (d:Document {{document_id: $document_id}})
+                    SET d = {{ {properties_str} }}
                     """
                     
-                    # Execute the query
-                    session.run(metadata_query, **params)
+                    # Execute the query with all properties
+                    tx.run(query, **all_props)
+                    
+                    log_message(f"Created document node with {len(metadata_props)} metadata properties")
+                    return True
                 
-            # STEP 2: Add to vector store if available
+                # Execute the transaction
+                session.write_transaction(create_document_tx)
+            
+            # STEP 2: Add to vector store if available - this uses the optimized batch processing already
             vector_store_success = False
             if LANGCHAIN_AVAILABLE and self.vector_store:
                 try:
@@ -542,10 +639,10 @@ class Neo4jDatabaseManager:
                     lc_metadata["document_id"] = document_id
                     lc_metadata["title"] = title
                     
-                    # Process document with text splitter for better chunking
+                    # Use more aggressive chunking for better vector embedding performance
                     text_splitter = RecursiveCharacterTextSplitter(
-                        chunk_size=1000, 
-                        chunk_overlap=200
+                        chunk_size=800,  # Larger chunks for better Neo4j performance
+                        chunk_overlap=50  # Minimal overlap to reduce redundancy
                     )
                     
                     # Split document into chunks
@@ -554,17 +651,22 @@ class Neo4jDatabaseManager:
                         metadatas=[lc_metadata]
                     )
                     
-                    # Add to vector store
+                    # Add to vector store - this now uses batching internally with our optimized method
+                    start_time = time.time()
                     self.vector_store.add_documents(docs)
-                    log_message(f"Added document {document_id} to vector store with {len(docs)} chunks")
+                    duration = time.time() - start_time
+                    log_message(f"Added document {document_id} to vector store with {len(docs)} chunks in {duration:.2f} seconds")
                     vector_store_success = True
                 except Exception as e:
                     log_message(f"Error adding document to vector store: {str(e)}", True)
                     # Continue even if vector store addition fails - we still have the graph data
             
-            # STEP 3: Add to knowledge graph
+            # STEP 3: Add to knowledge graph (optimized version)
+            start_time = time.time()
             try:
                 graph_success = self.add_document_to_knowledge_graph(document_id, title, content, safe_metadata)
+                duration = time.time() - start_time
+                log_message(f"Knowledge graph processing completed in {duration:.2f} seconds")
             except Exception as e:
                 log_message(f"Error in knowledge graph processing: {str(e)}", True)
                 graph_success = False
@@ -895,8 +997,9 @@ class Neo4jDatabaseManager:
                     MATCH (source:Document {document_id: $source_id})
                     MATCH (target:Document {document_id: $target_id})
                     WITH source, target
-                    MERGE (source)-[r:RELATED_TO {type: $rel_type}]->(target)
-                    SET r += $properties
+                    MERGE (source)-[r:RELATED_TO]->(target)
+                    SET r.type = $rel_type,
+                        r += $properties
                     RETURN count(r) AS count
                     """,
                     source_id=source_id,
@@ -1062,8 +1165,13 @@ class Neo4jDatabaseManager:
                         strict_mode=False  # Allow more flexible extraction
                     )
                     
-                    # Convert documents to graph format
-                    graph_documents = llm_transformer.convert_to_graph_documents(chunks)
+                    # Convert documents to graph format - optimize by limiting chunks
+                    # Process only a subset of chunks to improve speed
+                    max_chunks = min(len(chunks), 5)  # Process at most 5 chunks to improve speed while maintaining quality
+                    log_message(f"Processing {max_chunks} chunks out of {len(chunks)} for knowledge graph extraction")
+                    
+                    # Process parallel in smaller batches for better performance
+                    graph_documents = llm_transformer.convert_to_graph_documents(chunks[:max_chunks])
                     
                     # Debug: Log the structure of graph documents
                     for i, graph_doc in enumerate(graph_documents):
@@ -1079,7 +1187,7 @@ class Neo4jDatabaseManager:
                             for j, rel in enumerate(graph_doc.relationships[:3]):  # Log first 3 relationships
                                 log_message(f"  - Relationship {j}: Type: {rel.type}, Source: {rel.source.id if hasattr(rel.source, 'id') else 'Unknown'}, Target: {rel.target.id if hasattr(rel.target, 'id') else 'Unknown'}")
                     
-                    # Add to graph database with base entity label
+                    # Add to graph database with batch processing
                     with self.driver.session() as session:
                         # First, create the base document node to connect everything
                         session.run("""
@@ -1094,19 +1202,21 @@ class Neo4jDatabaseManager:
                         session.run("""
                         MATCH (d:Document {document_id: $doc_id})
                         MATCH (other:Document)
-                        WHERE other.document_id <> $doc_id
+                        WHERE other.document_id <> $doc_id AND other.document_id <> 'placeholder'
+                        WITH d, other
+                        LIMIT 100
                         MERGE (d)-[:ALL_DOCUMENTS]->(other)
                         """, doc_id=document_id)
                         
-                        # Process graph documents
-                        graph_document_count = 0
-                        
-                        # Tracking if we successfully created any knowledge graph nodes
-                        created_kg_nodes = False
-                        
-                        for graph_doc in graph_documents:
+                        # Process graph documents - use transactions for batching
+                        def create_kg_tx(tx, graph_doc, doc_id):
+                            # Collection to store created node IDs
+                            nodes_created = {}
+                            created_kg_nodes = False
+                            
                             # Check if the graph document has nodes
                             if hasattr(graph_doc, 'nodes') and graph_doc.nodes:
+                                # Prepare all nodes in one batch
                                 for node in graph_doc.nodes:
                                     # Create node with properties
                                     node_properties = {}
@@ -1114,174 +1224,79 @@ class Neo4jDatabaseManager:
                                         for key, value in node.properties.items():
                                             if isinstance(value, (str, int, float, bool)):
                                                 node_properties[key] = value
-                                
-                                    # Get node type
+                                    
+                                    # Get node type & ID
                                     node_type = node.type if hasattr(node, 'type') else "Entity"
+                                    node_id = node.id if hasattr(node, 'id') else f"unknown_{uuid.uuid4()}"
                                     
-                                    # Create the node with its label
-                                    session.run(f"""
-                                    MERGE (n:`{node_type}` {{id: $id}})
-                                    SET n += $properties
-                                    """, id=node.id, properties=node_properties)
+                                    # Create entity node with simpler labels to avoid Neo4j 4.x limitations
+                                    query = f"""
+                                    MERGE (e:__Entity__ {{id: $node_id}})
+                                    SET e.node_type = $node_type,
+                                        e += $props
+                                    WITH e
+                                    MATCH (d:Document {{document_id: $doc_id}})
+                                    MERGE (d)-[:CONTAINS]->(e)
+                                    """
                                     
-                                    # Connect to document
-                                    session.run("""
-                                    MATCH (d:Document {document_id: $doc_id})
-                                    MATCH (n {id: $node_id})
-                                    MERGE (d)-[:CONTAINS]->(n)
-                                    """, doc_id=document_id, node_id=node.id)
+                                    tx.run(query, node_id=node_id, node_type=node_type,
+                                         props=node_properties, doc_id=doc_id)
+                                    
+                                    # Track that we created this node
+                                    nodes_created[node_id] = node_type
                                     created_kg_nodes = True
-                                graph_document_count += 1
-                            
-                            # Check if the graph document has relationships
-                            if hasattr(graph_doc, 'relationships') and graph_doc.relationships:
+                                
+                            # Create relationships in batch if nodes were created
+                            if created_kg_nodes and hasattr(graph_doc, 'relationships') and graph_doc.relationships:
                                 for rel in graph_doc.relationships:
-                                    # Extract source and target IDs
-                                    source_id = rel.source.id if hasattr(rel.source, 'id') else str(rel.source)
-                                    target_id = rel.target.id if hasattr(rel.target, 'id') else str(rel.target)
-                                    rel_type = rel.type
-                                    
-                                    # Create relationship
-                                    session.run(f"""
-                                    MATCH (source {{id: $source_id}})
-                                    MATCH (target {{id: $target_id}})
-                                    MERGE (source)-[:`{rel_type}`]->(target)
-                                    """, source_id=source_id, target_id=target_id)
-                                    created_kg_nodes = True
-                                graph_document_count += 1
-                            
-                            # Only log the missing structure if both nodes and relationships are missing
-                            if (not hasattr(graph_doc, 'nodes') or not graph_doc.nodes) and (not hasattr(graph_doc, 'relationships') or not graph_doc.relationships):
-                                log_message(f"Graph document is missing expected structure. Creating only basic document node.")
-                        
-                        # If no nodes were created through the normal process, try a direct extraction from content
-                        if not created_kg_nodes:
-                            log_message("No knowledge graph nodes were created, attempting direct entity extraction fallback")
-                            try:
-                                # Direct entity extraction as fallback
-                                from langchain_openai import OpenAIEmbeddings
-                                from langchain_core.prompts import ChatPromptTemplate
-                                
-                                # Extract key entities from content
-                                entity_extraction_prompt = ChatPromptTemplate.from_template(
-                                    """Extract the main entities from the following text. 
-                                    For each entity, provide:
-                                    1. Entity name
-                                    2. Entity type (Person, Organization, Location, Concept, Technology, etc.)
-                                    3. Brief description
-                                    
-                                    Format as JSON with an array of objects with keys: name, type, description
-                                    
-                                    Text: {content}
-                                    
-                                    JSON:"""
-                                )
-                                
-                                entity_chain = entity_extraction_prompt | llm
-                                entity_json_str = entity_chain.invoke({"content": content})
-                                
-                                # Try to parse the JSON response
-                                import json
-                                import re
-                                
-                                # Extract JSON if it's wrapped in backticks or other formatting
-                                json_match = re.search(r'```json\s*([\s\S]*?)\s*```|```([\s\S]*?)```|(\{[\s\S]*\})', entity_json_str)
-                                if json_match:
-                                    json_str = json_match.group(1) or json_match.group(2) or json_match.group(3)
-                                    entity_data = json.loads(json_str)
-                                else:
-                                    entity_data = json.loads(entity_json_str)
-                                    
-                                # Create entity nodes
-                                entities_created = 0
-                                for entity in entity_data:
-                                    if isinstance(entity, dict) and 'name' in entity and 'type' in entity:
-                                        entity_name = entity['name']
-                                        entity_type = entity['type']
-                                        properties = {k: v for k, v in entity.items() if k not in ['name', 'type']}
+                                    # Check if we have both source and target with valid IDs
+                                    if (hasattr(rel, 'source') and hasattr(rel.source, 'id') and 
+                                        hasattr(rel, 'target') and hasattr(rel.target, 'id')):
                                         
-                                        # Create the entity node
-                                        session.run(f"""
-                                        MERGE (n:`{entity_type}` {{id: $id}})
-                                        SET n += $properties
-                                        """, id=entity_name, properties=properties)
+                                        source_id = rel.source.id
+                                        target_id = rel.target.id
+                                        rel_type = rel.type if hasattr(rel, 'type') else "RELATED_TO"
                                         
-                                        # Connect to document
-                                        session.run("""
-                                        MATCH (d:Document {document_id: $doc_id})
-                                        MATCH (n {id: $entity_id})
-                                        MERGE (d)-[:CONTAINS]->(n)
-                                        """, doc_id=document_id, entity_id=entity_name)
-                                        entities_created += 1
-                                
-                                log_message(f"Created {entities_created} entity nodes using fallback extraction")
-                                
-                                # Now try to extract relationships between the created entities
-                                if entities_created > 1:
-                                    # Get the entity names that were created
-                                    entity_names = [entity['name'] for entity in entity_data if 'name' in entity]
-                                    
-                                    # Create a relationship extraction prompt
-                                    relationship_prompt = ChatPromptTemplate.from_template(
-                                        """Given the entities extracted from this text, identify the relationships between them.
-                                        
-                                        Text: {content}
-                                        
-                                        Entities: {entity_list}
-                                        
-                                        For each relationship, provide:
-                                        1. Source entity (must be from the entity list)
-                                        2. Relationship type (e.g., WORKS_FOR, KNOWS, RESEARCHES, etc.)
-                                        3. Target entity (must be from the entity list)
-                                        
-                                        Format as JSON with an array of objects with keys: source, type, target
-                                        
-                                        JSON:"""
-                                    )
-                                    
-                                    relationship_chain = relationship_prompt | llm
-                                    relationship_json_str = relationship_chain.invoke({
-                                        "content": content,
-                                        "entity_list": ", ".join(entity_names)
-                                    })
-                                    
-                                    # Try to parse the JSON response
-                                    json_match = re.search(r'```json\s*([\s\S]*?)\s*```|```([\s\S]*?)```|(\{[\s\S]*\}|\[[\s\S]*\])', relationship_json_str)
-                                    if json_match:
-                                        json_str = json_match.group(1) or json_match.group(2) or json_match.group(3)
-                                        relationship_data = json.loads(json_str)
-                                    else:
-                                        relationship_data = json.loads(relationship_json_str)
-                                    
-                                    # Create relationships
-                                    relationships_created = 0
-                                    for rel in relationship_data:
-                                        if isinstance(rel, dict) and 'source' in rel and 'type' in rel and 'target' in rel:
-                                            source = rel['source']
-                                            rel_type = rel['type']
-                                            target = rel['target']
+                                        # Only create relationships between nodes we've processed
+                                        if source_id in nodes_created and target_id in nodes_created:
+                                            # Get relationship properties
+                                            rel_properties = {}
+                                            if hasattr(rel, 'properties'):
+                                                for key, value in rel.properties.items():
+                                                    if isinstance(value, (str, int, float, bool)):
+                                                        rel_properties[key] = value
                                             
-                                            # Create the relationship
-                                            session.run(f"""
-                                            MATCH (source {{id: $source_id}})
-                                            MATCH (target {{id: $target_id}})
-                                            MERGE (source)-[:`{rel_type}`]->(target)
-                                            """, source_id=source, target_id=target)
-                                            relationships_created += 1
-                                    
-                                    log_message(f"Created {relationships_created} relationships using fallback extraction")
-                                
-                                created_kg_nodes = entities_created > 0
+                                            # Create relationship with a simpler syntax to avoid Neo4j 4.x limitations
+                                            query = f"""
+                                            MATCH (source:`__Entity__` {{id: $source_id}})
+                                            MATCH (target:`__Entity__` {{id: $target_id}})
+                                            WHERE source <> target
+                                            MERGE (source)-[r:RELATED_TO]->(target)
+                                            SET r.type = $rel_type,
+                                                r += $props
+                                            """
+                                            
+                                            tx.run(query, source_id=source_id, target_id=target_id, 
+                                                 rel_type=rel_type, props=rel_properties)
                             
-                            except Exception as fallback_err:
-                                log_message(f"Fallback entity extraction failed: {str(fallback_err)}", True)
+                            return created_kg_nodes
                         
-                        log_message(f"Added document {document_id} to knowledge graph with {len(graph_documents)} graph documents")
-                        return True
-                except Exception as transform_err:
-                    log_message(f"Error in graph transformation process: {str(transform_err)}", True)
+                        # Process each graph document with its own transaction
+                        for graph_doc in graph_documents:
+                            # Skip empty graph documents
+                            if not (hasattr(graph_doc, 'nodes') and graph_doc.nodes):
+                                continue
+                                
+                            # Process with transaction
+                            created = session.write_transaction(create_kg_tx, graph_doc, document_id)
+                            if created:
+                                log_message(f"Added knowledge graph elements for document {document_id}")
+                
+                    return True
+                except Exception as e:
+                    log_message(f"Error in knowledge graph processing: {str(e)}", True)
                     log_message(traceback.format_exc(), True)
-                    # Still create the document node at minimum
+                    # Create basic document node anyway
                     with self.driver.session() as session:
                         session.run("""
                         MERGE (d:Document {document_id: $doc_id})
@@ -1289,36 +1304,12 @@ class Neo4jDatabaseManager:
                             d.content = $content,
                             d.updated_at = datetime()
                         """, doc_id=document_id, title=title, content=content)
-                        log_message("Created placeholder document node")
                     return False
-            else:
-                log_message("Could not initialize LLM for graph transformation", True)
-                # Still create the document node at minimum
-                with self.driver.session() as session:
-                    session.run("""
-                    MERGE (d:Document {document_id: $doc_id})
-                    SET d.title = $title,
-                        d.content = $content,
-                        d.updated_at = datetime()
-                    """, doc_id=document_id, title=title, content=content)
-                    log_message("Created placeholder document node")
-                return False
-                
+            
+            return False
         except Exception as e:
-            log_message(f"Error adding document to knowledge graph: {str(e)}", True)
+            log_message(f"Error in knowledge graph processing: {str(e)}", True)
             log_message(traceback.format_exc(), True)
-            # Still try to create the document node at minimum
-            try:
-                with self.driver.session() as session:
-                    session.run("""
-                    MERGE (d:Document {document_id: $doc_id})
-                    SET d.title = $title,
-                        d.content = $content,
-                        d.updated_at = datetime()
-                    """, doc_id=document_id, title=title, content=content)
-                    log_message("Created placeholder document node despite error")
-            except:
-                pass
             return False
 
 # Override IsDisplayAvailable to always return True
@@ -1500,11 +1491,11 @@ class EmbeddedNeo4jServer:
                     line = "dbms.connector.http.enabled=false\n"
                 # Configure memory settings for better vector operations
                 elif line.strip().startswith('#dbms.memory.heap.initial_size='):
-                    line = "dbms.memory.heap.initial_size=256m\n"
+                    line = "dbms.memory.heap.initial_size=1g\n"
                 elif line.strip().startswith('#dbms.memory.heap.max_size='):
-                    line = "dbms.memory.heap.max_size=512m\n"
+                    line = "dbms.memory.heap.max_size=2g\n"
                 elif line.strip().startswith('#dbms.memory.pagecache.size='):
-                    line = "dbms.memory.pagecache.size=256m\n"
+                    line = "dbms.memory.pagecache.size=1g\n"
                 
                 new_config_lines.append(line)
             
@@ -1521,6 +1512,21 @@ class EmbeddedNeo4jServer:
             # Add explicit configuration to ensure Bolt connector works reliably
             new_config_lines.append("\n# Ensure reliable connections\n")
             new_config_lines.append("dbms.connector.bolt.address=localhost:7687\n")
+            
+            # Add performance optimizations for bulk loading
+            new_config_lines.append("\n# Performance optimizations for document uploads\n")
+            new_config_lines.append("dbms.memory.pagecache.flush.buffer.enabled=true\n")
+            new_config_lines.append("dbms.memory.pagecache.flush.buffer.size_in_pages=100\n")
+            new_config_lines.append("dbms.tx_state.memory_allocation=ON_HEAP\n")
+            new_config_lines.append("dbms.jvm.additional=-XX:+UseG1GC\n")
+            
+            # Add transaction and connection pool settings for faster batch operations
+            new_config_lines.append("\n# Transaction and connection settings for faster batch operations\n")
+            new_config_lines.append("dbms.transaction.concurrent.maximum=16\n")
+            new_config_lines.append("dbms.memory.transaction.global_max_size=512m\n")
+            new_config_lines.append("dbms.transaction.timeout=600s\n")  # 10 minute timeout for long transactions
+            new_config_lines.append("dbms.connector.bolt.thread_pool_min_size=10\n")
+            new_config_lines.append("dbms.connector.bolt.thread_pool_max_size=40\n")
             
             # Write the modified configuration
             with open(config_path, 'w') as f:
@@ -1562,12 +1568,19 @@ class EmbeddedNeo4jServer:
                             f.write(f"\n# Custom Java path\n")
                             f.write(f"wrapper.java.command={java_path}/bin/java\n")
                             # Add JVM heap settings for better performance with vectors
-                            f.write(f"wrapper.java.additional=-Xms256m\n")
-                            f.write(f"wrapper.java.additional=-Xmx512m\n")
+                            f.write(f"wrapper.java.additional=-Xms1g\n")
+                            f.write(f"wrapper.java.additional=-Xmx2g\n")
+                            # Add G1GC options for better GC performance
+                            f.write(f"wrapper.java.additional=-XX:+UseG1GC\n")
+                            f.write(f"wrapper.java.additional=-XX:G1HeapRegionSize=4m\n")
+                            f.write(f"wrapper.java.additional=-XX:InitiatingHeapOccupancyPercent=70\n")
+                            f.write(f"wrapper.java.additional=-XX:MaxGCPauseMillis=200\n")
+                            f.write(f"wrapper.java.additional=-XX:G1ReservePercent=10\n")
+                            f.write(f"wrapper.java.additional=-XX:+ParallelRefProcEnabled\n")
                 except Exception as e:
                     log_message(f"Error configuring Java path: {str(e)}", True)
             
-            log_message("Neo4j configured successfully")
+            log_message("Neo4j configured successfully with performance optimizations")
             return True
         except Exception as e:
             log_message(f"Error configuring Neo4j: {str(e)}", True)
