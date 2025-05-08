@@ -290,34 +290,30 @@ class Neo4jDatabaseManager:
             
             # Create the necessary schema using the Neo4j driver directly
             with self.driver.session() as session:
-                # Check if constraint exists first (for Neo4j 4.x)
-                constraint_check = session.run("""
-                SHOW CONSTRAINTS
-                """)
-                
-                # Process results to check if our constraint exists
-                constraint_exists = False
-                for record in constraint_check:
-                    if "Document.document_id" in str(record):
-                        constraint_exists = True
-                        break
-                
                 # Create constraint if it doesn't exist (Neo4j 4.x syntax)
-                if not constraint_exists:
+                try:
                     session.run("""
                     CREATE CONSTRAINT ON (d:Document) 
                     ASSERT d.document_id IS UNIQUE
                     """)
                     log_message("Created document ID constraint")
-                else:
-                    log_message("Document ID constraint already exists")
+                except Exception as e:
+                    # If the constraint already exists, just log and continue
+                    if "EquivalentSchemaRuleAlreadyExists" in str(e):
+                        log_message("Document ID constraint already exists", True)
+                    else:
+                        # If it's some other error, log it but continue
+                        log_message(f"Warning creating constraint: {str(e)}", True)
                 
                 # Create a simple node to ensure we have at least one node in the graph
                 # This helps when initializing from an existing graph
-                session.run("""
-                MERGE (d:Document {document_id: 'placeholder', content: 'Initial placeholder document'})
-                """)
-                log_message("Created placeholder document node")
+                try:
+                    session.run("""
+                    MERGE (d:Document {document_id: 'placeholder', content: 'Initial placeholder document'})
+                    """)
+                    log_message("Created placeholder document node")
+                except Exception as e:
+                    log_message(f"Warning creating placeholder: {str(e)}", True)
                 
             # Create our custom Neo4j vector store implementation compatible with Neo4j 4.x
             from langchain_core.documents import Document
@@ -1793,6 +1789,9 @@ class EmbeddedNeo4jServer:
                     line = "dbms.memory.heap.max_size=2g\n"
                 elif line.strip().startswith('#dbms.memory.pagecache.size='):
                     line = "dbms.memory.pagecache.size=1g\n"
+                # Disable shell server to avoid port conflicts (1337) commonly seen on Mac
+                elif line.strip().startswith('#dbms.shell.enabled='):
+                    line = "dbms.shell.enabled=false\n"
                 
                 new_config_lines.append(line)
             
@@ -1816,6 +1815,10 @@ class EmbeddedNeo4jServer:
             new_config_lines.append("dbms.memory.pagecache.flush.buffer.size_in_pages=100\n")
             new_config_lines.append("dbms.tx_state.memory_allocation=ON_HEAP\n")
             new_config_lines.append("dbms.jvm.additional=-XX:+UseG1GC\n")
+            
+            # Explicitly disable shell server to prevent port conflicts on Mac (port 1337)
+            new_config_lines.append("\n# Disable shell server to prevent port conflicts\n")
+            new_config_lines.append("dbms.shell.enabled=false\n")
             
             # Add transaction and connection pool settings for faster batch operations
             new_config_lines.append("\n# Transaction and connection settings for faster batch operations\n")
