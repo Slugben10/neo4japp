@@ -20,6 +20,7 @@ import re
 import select
 import importlib
 import uuid
+import tempfile
 
 # Define a function to check if a package is installed
 def check_package_installed(package_name):
@@ -1344,49 +1345,345 @@ class EmbeddedNeo4jServer:
     def check_java_version(self):
         """Check if compatible Java version is installed"""
         try:
-            # First, check if we have a bundled JRE
-            bundled_java = self.check_bundled_jre()
-            if bundled_java:
-                log_message(f"Found bundled JRE - will use for Neo4j")
-                return True, "Bundled Java 11 JRE available"
-            
-            # If no bundled JRE, check system Java
-            # Run java -version and capture output
-            result = subprocess.run(
-                ["java", "-version"], 
-                capture_output=True, 
-                text=True,
-                check=False
-            )
-            
-            # Java sends version info to stderr
-            version_output = result.stderr
-            
-            log_message(f"Java version check: {version_output}")
-            
-            # Extract the version number using regex
-            import re
-            version_pattern = re.compile(r'"(\d+)\.(\d+)')
-            match = version_pattern.search(version_output)
-            
-            if match:
-                major, minor = match.groups()
-                log_message(f"Detected Java version: {major}.{minor}")
+            # First check for bundled JRE
+            if self.check_bundled_jre():
+                log_message("Found bundled JRE for Neo4j")
+                return True
                 
-                # Check if Java 11 or higher
-                if int(major) > 1 or (int(major) == 1 and int(minor) >= 11):
-                    log_message(f"Compatible Java version {major}.{minor} detected")
-                    return True, f"Java {major}.{minor}"
-                else:
-                    log_message(f"Java {major}.{minor} detected, but Neo4j requires Java 11 or higher", True)
-                    return False, f"Neo4j requires Java 11 or higher. Please install Java 11 or 17."
-            else:
-                log_message("Could not determine Java version from output", True)
-                return False, "Could not determine Java version"
+            # Check system Java
+            try:
+                java_cmd = "java"
+                
+                # Run java -version and capture output
+                proc = subprocess.run(
+                    [java_cmd, "-version"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                
+                # Combine stdout and stderr since java -version outputs to stderr
+                output = proc.stdout + proc.stderr
+                
+                if proc.returncode != 0:
+                    log_message(f"Java check failed with return code {proc.returncode}", True)
+                    log_message(f"Java error output: {output}", True)
+                    return False
+                
+                # Extract version information
+                log_message(f"Java version output: {output}")
+                
+                # Check if this is a compatible version (Java 11+)
+                if "version" in output:
+                    version_pattern = r'version "([^"]+)"'
+                    matches = re.search(version_pattern, output)
+                    
+                    if matches:
+                        version = matches.group(1)
+                        log_message(f"Found Java version: {version}")
+                        
+                        # Check major version
+                        # Look for patterns like "11.x.x" or "1.8.x"
+                        major_version_pattern = r'(\d+)[\._]'
+                        major_matches = re.search(major_version_pattern, version)
+                        
+                        if major_matches:
+                            major_version = int(major_matches.group(1))
+                            
+                            # Neo4j 4.4 requires Java 11 or higher
+                            if major_version >= 11:
+                                log_message(f"Java version {major_version} is compatible with Neo4j")
+                                return True
+                            else:
+                                log_message(f"Java version {major_version} is not compatible with Neo4j (needs 11+)", True)
+                                return False
+                
+                log_message("Could not determine Java version, will attempt to use anyway")
+                return True
+                
+            except Exception as e:
+                log_message(f"Error checking Java version: {str(e)}", True)
+                return False
                 
         except Exception as e:
-            log_message(f"Error checking Java version: {str(e)}", True)
-            return False, f"Failed to check Java version: {str(e)}"
+            log_message(f"Error in Java version check: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            return False
+    
+    def install_java(self):
+        """Download and install Java 11 for Neo4j"""
+        try:
+            log_message("Starting Java 11 installation for Neo4j...")
+            
+            # Create jre directory if it doesn't exist
+            jre_dir = os.path.join(self.base_path, "jre")
+            os.makedirs(jre_dir, exist_ok=True)
+            
+            # Determine download URL based on system architecture
+            system = platform.system().lower()
+            machine = platform.machine().lower()
+            
+            # Create a temporary directory for download
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                if system == "darwin":  # macOS
+                    if "arm" in machine or "aarch64" in machine:  # Apple Silicon
+                        url = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_aarch64_mac_hotspot_11.0.21_9.tar.gz"
+                    else:  # Intel Mac
+                        url = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_x64_mac_hotspot_11.0.21_9.tar.gz"
+                    
+                    archive_path = os.path.join(tmp_dir, "openjdk-11-jre.tar.gz")
+                elif system == "windows":  # Windows
+                    url = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_x64_windows_hotspot_11.0.21_9.zip"
+                    archive_path = os.path.join(tmp_dir, "openjdk-11-jre.zip")
+                elif system == "linux":  # Linux
+                    if "arm" in machine or "aarch64" in machine:  # ARM
+                        url = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_aarch64_linux_hotspot_11.0.21_9.tar.gz"
+                    else:  # x86_64
+                        url = "https://github.com/adoptium/temurin11-binaries/releases/download/jdk-11.0.21%2B9/OpenJDK11U-jre_x64_linux_hotspot_11.0.21_9.tar.gz"
+                    archive_path = os.path.join(tmp_dir, "openjdk-11-jre.tar.gz")
+                else:
+                    log_message(f"Unsupported platform: {system} {machine}", True)
+                    return False
+                
+                # 1. Download the JRE
+                log_message(f"Downloading Java 11 JRE from {url}")
+                try:
+                    response = requests.get(url, stream=True)
+                    if response.status_code != 200:
+                        log_message(f"Failed to download Java JRE: HTTP {response.status_code}", True)
+                        return False
+                    
+                    with open(archive_path, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    log_message("Java 11 JRE download complete")
+                except Exception as e:
+                    log_message(f"Error downloading Java JRE: {str(e)}", True)
+                    return False
+                
+                # 2. Extract the archive
+                log_message(f"Extracting Java 11 JRE to {jre_dir}")
+                try:
+                    # If jre directory already exists, remove it first
+                    if os.path.exists(jre_dir):
+                        shutil.rmtree(jre_dir)
+                    os.makedirs(jre_dir, exist_ok=True)
+                    
+                    if archive_path.endswith('.tar.gz'):
+                        with tarfile.open(archive_path, 'r:gz') as tar:
+                            # Create a temporary extraction directory
+                            extract_dir = os.path.join(tmp_dir, "extracted")
+                            os.makedirs(extract_dir, exist_ok=True)
+                            tar.extractall(extract_dir)
+                            
+                            # Find the JRE directory (usually there's a single top-level directory)
+                            extracted_dirs = [d for d in os.listdir(extract_dir) if os.path.isdir(os.path.join(extract_dir, d))]
+                            if not extracted_dirs:
+                                log_message("No directories found in extracted archive", True)
+                                return False
+                            
+                            # Move the contents to the Java directory
+                            src_dir = os.path.join(extract_dir, extracted_dirs[0])
+                            
+                            # On macOS, preserve the special directory structure
+                            if system == "darwin" and os.path.exists(os.path.join(src_dir, "Contents")):
+                                # This is a macOS .jdk package structure
+                                for item in os.listdir(src_dir):
+                                    shutil.move(os.path.join(src_dir, item), os.path.join(jre_dir, item))
+                            else:
+                                # Standard structure
+                                shutil.copytree(src_dir, jre_dir, dirs_exist_ok=True)
+                    
+                    elif archive_path.endswith('.zip'):
+                        with zipfile.ZipFile(archive_path, 'r') as zip_ref:
+                            # Create a temporary extraction directory
+                            extract_dir = os.path.join(tmp_dir, "extracted")
+                            os.makedirs(extract_dir, exist_ok=True)
+                            zip_ref.extractall(extract_dir)
+                            
+                            # Find the JRE directory
+                            extracted_dirs = [d for d in os.listdir(extract_dir) if os.path.isdir(os.path.join(extract_dir, d))]
+                            if not extracted_dirs:
+                                log_message("No directories found in extracted archive", True)
+                                return False
+                            
+                            # Move the contents to the Java directory
+                            src_dir = os.path.join(extract_dir, extracted_dirs[0])
+                            shutil.copytree(src_dir, jre_dir, dirs_exist_ok=True)
+                    
+                    log_message("Java 11 JRE extracted successfully")
+                except Exception as e:
+                    log_message(f"Error extracting Java JRE: {str(e)}", True)
+                    log_message(traceback.format_exc(), True)
+                    return False
+                
+                # 3. Make executables executable on Unix systems
+                if system != "windows":
+                    try:
+                        # Determine the bin directory
+                        if system == "darwin" and os.path.exists(os.path.join(jre_dir, "Contents", "Home", "bin")):
+                            bin_dir = os.path.join(jre_dir, "Contents", "Home", "bin")
+                        else:
+                            bin_dir = os.path.join(jre_dir, "bin")
+                        
+                        if os.path.exists(bin_dir):
+                            for file in os.listdir(bin_dir):
+                                file_path = os.path.join(bin_dir, file)
+                                if os.path.isfile(file_path):
+                                    # Make executable
+                                    os.chmod(file_path, 0o755)
+                            log_message(f"Made Java executables executable in {bin_dir}")
+                        else:
+                            log_message(f"Bin directory not found at {bin_dir}", True)
+                    except Exception as e:
+                        log_message(f"Error setting executable permissions: {str(e)}", True)
+                
+                # 4. Verify installation
+                java_bin = None
+                if system == "darwin" and os.path.exists(os.path.join(jre_dir, "Contents", "Home", "bin", "java")):
+                    java_bin = os.path.join(jre_dir, "Contents", "Home", "bin", "java")
+                elif os.path.exists(os.path.join(jre_dir, "bin", "java")):
+                    java_bin = os.path.join(jre_dir, "bin", "java")
+                elif system == "windows" and os.path.exists(os.path.join(jre_dir, "bin", "java.exe")):
+                    java_bin = os.path.join(jre_dir, "bin", "java.exe")
+                
+                if not java_bin or not os.path.exists(java_bin):
+                    log_message("Java executable not found in installed JRE", True)
+                    return False
+                
+                # Test the Java installation
+                try:
+                    result = subprocess.run(
+                        [java_bin, "-version"],
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True
+                    )
+                    version_output = result.stdout + result.stderr
+                    log_message(f"Installed Java version: {version_output.strip()}")
+                    
+                    if "11." not in version_output and "11]" not in version_output:
+                        log_message("Warning: Installed Java does not appear to be version 11", True)
+                    
+                except Exception as e:
+                    log_message(f"Error testing Java installation: {str(e)}", True)
+                    return False
+                
+                # 5. Configure Neo4j to use the new Java
+                try:
+                    # Determine Java home directory
+                    if system == "darwin" and os.path.exists(os.path.join(jre_dir, "Contents", "Home")):
+                        java_home = os.path.join(jre_dir, "Contents", "Home")
+                    else:
+                        java_home = jre_dir
+                    
+                    # Set environment variables
+                    os.environ["JAVA_HOME"] = java_home
+                    path_separator = ";" if system == "windows" else ":"
+                    os.environ["PATH"] = os.path.dirname(java_bin) + path_separator + os.environ.get("PATH", "")
+                    
+                    # Set up wrapper configuration
+                    neo4j_dir = os.path.join(self.base_path, "Neo4jDB", "neo4j-server")
+                    if os.path.exists(neo4j_dir):
+                        # Create conf directory if it doesn't exist
+                        conf_dir = os.path.join(neo4j_dir, "conf")
+                        os.makedirs(conf_dir, exist_ok=True)
+                        
+                        # Create wrapper configuration file
+                        wrapper_conf = os.path.join(conf_dir, "neo4j-wrapper.conf")
+                        with open(wrapper_conf, 'w') as f:
+                            f.write("# Neo4j wrapper configuration\n")
+                            f.write("# Automatically configured by Neo4j Research Assistant\n\n")
+                            # Escape backslashes on Windows
+                            if system == "windows":
+                                java_bin_esc = java_bin.replace("\\", "\\\\")
+                            else:
+                                java_bin_esc = java_bin
+                            f.write(f"wrapper.java.command={java_bin_esc}\n")
+                        
+                        # Update startup scripts
+                        if system != "windows":
+                            # Unix-like system
+                            neo4j_script = os.path.join(neo4j_dir, "bin", "neo4j")
+                            if os.path.exists(neo4j_script):
+                                # Read the script
+                                with open(neo4j_script, 'r') as f:
+                                    script_lines = f.readlines()
+                                
+                                # Look for JAVA_HOME setting
+                                java_home_line = -1
+                                for i, line in enumerate(script_lines):
+                                    if "JAVA_HOME" in line and not line.strip().startswith('#'):
+                                        java_home_line = i
+                                        break
+                                
+                                if java_home_line >= 0:
+                                    # Replace existing JAVA_HOME
+                                    script_lines[java_home_line] = f'JAVA_HOME="{java_home}"\n'
+                                else:
+                                    # Add JAVA_HOME after shebang
+                                    script_lines.insert(1, f'JAVA_HOME="{java_home}"\n')
+                                    script_lines.insert(2, f'export JAVA_HOME\n')
+                                    script_lines.insert(3, f'PATH="{os.path.dirname(java_bin)}:$PATH"\n')
+                                    script_lines.insert(4, f'export PATH\n')
+                                
+                                # Write the updated script
+                                with open(neo4j_script, 'w') as f:
+                                    f.writelines(script_lines)
+                                
+                                # Make executable
+                                os.chmod(neo4j_script, 0o755)
+                        else:
+                            # Windows
+                            neo4j_bat = os.path.join(neo4j_dir, "bin", "neo4j.bat")
+                            if os.path.exists(neo4j_bat):
+                                # Read the script
+                                with open(neo4j_bat, 'r') as f:
+                                    script_lines = f.readlines()
+                                
+                                # Look for JAVA_HOME setting
+                                java_home_line = -1
+                                for i, line in enumerate(script_lines):
+                                    if "JAVA_HOME" in line and not line.strip().lower().startswith('rem'):
+                                        java_home_line = i
+                                        break
+                                
+                                if java_home_line >= 0:
+                                    # Replace existing JAVA_HOME
+                                    script_lines[java_home_line] = f'set "JAVA_HOME={java_home}"\r\n'
+                                else:
+                                    # Add JAVA_HOME after initial comments
+                                    insert_pos = 0
+                                    for i, line in enumerate(script_lines):
+                                        if not line.strip().lower().startswith('rem') and line.strip():
+                                            insert_pos = i
+                                            break
+                                    
+                                    script_lines.insert(insert_pos, f'set "JAVA_HOME={java_home}"\r\n')
+                                    script_lines.insert(insert_pos + 1, f'set "PATH={os.path.dirname(java_bin)};%PATH%"\r\n')
+                                
+                                # Write the updated script
+                                with open(neo4j_bat, 'w') as f:
+                                    f.writelines(script_lines)
+                        
+                        log_message("Neo4j configured to use the installed Java")
+                    else:
+                        log_message("Neo4j server directory not found, skipping configuration", True)
+                
+                except Exception as e:
+                    log_message(f"Error configuring Neo4j to use Java: {str(e)}", True)
+                    log_message(traceback.format_exc(), True)
+                    return False
+            
+            log_message("Java 11 installation completed successfully")
+            return True
+            
+        except Exception as e:
+            log_message(f"Error installing Java: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            return False
     
     def download_if_needed(self):
         """Download Neo4j server if it doesn't exist"""
@@ -1590,33 +1887,43 @@ class EmbeddedNeo4jServer:
     def start(self):
         """Start the Neo4j server process"""
         try:
-            # First kill any stale processes
-            self.kill_stale_processes()
+            # If the server is already running, just return
+            if self.running and self.process and self.process.poll() is None:
+                log_message("Neo4j server is already running")
+                return True
             
-            # Check if Java is available
-            java_ok, java_message = self.check_java_version()
-            if not java_ok:
-                log_message(f"Cannot start Neo4j: {java_message}", True)
-                return False
-            
-            # Download Neo4j if needed
+            # Check if Neo4j server is installed
             if not self._is_neo4j_installed():
-                log_message("Neo4j server not found, attempting to download...")
+                log_message("Neo4j server is not installed, downloading...")
                 if not self.download_if_needed():
                     log_message("Failed to download Neo4j server", True)
                     return False
             
-            # Check if already running
-            if self.running and self.process and self.process.poll() is None:
-                log_message("Neo4j server already running")
-                return True
+            # Check if Java is installed and compatible version
+            if not self.check_java_version():
+                log_message("Compatible Java version not found, attempting to install Java 11...")
+                if not self.install_java():
+                    log_message("Failed to install Java 11. Neo4j server cannot start", True)
+                    return False
+                log_message("Java 11 installed successfully, continuing with Neo4j startup")
+            
+            # Kill any stale Java/Neo4j processes
+            self.kill_stale_processes()
+            
+            # Check if we should preserve Neo4j data
+            preserve_data = os.environ.get('PRESERVE_NEO4J_DATA', 'True').lower() == 'true'
+            
+            # Check for a preservation marker file
+            preserve_marker = os.path.join(self.base_path, "Neo4jDB", ".preserve")
+            if os.path.exists(preserve_marker):
+                preserve_data = True
             
             # If there was a previous failure, try to clean up
             if hasattr(self, '_connection_failure_count') and self._connection_failure_count >= 3:
                 log_message("Previous connection failures detected, attempting to reinstall Neo4j...", True)
                 self.stop()  # Make sure any existing process is stopped
                 
-                # Remove existing Neo4j installation and try fresh
+                # Remove existing Neo4j installation and try fresh (even if preservation is enabled)
                 if os.path.exists(self.server_dir):
                     try:
                         shutil.rmtree(self.server_dir)
@@ -1631,7 +1938,7 @@ class EmbeddedNeo4jServer:
                 
                 self._connection_failure_count = 0
             else:
-                # Clean up database files to avoid corruption issues
+                # Clean up database files only if not preserving data or only lock files if preserving
                 self.cleanup_database_files()
             
             log_message("Starting Neo4j server...")
@@ -1950,6 +2257,35 @@ class EmbeddedNeo4jServer:
     def cleanup_database_files(self):
         """Clean up database files to avoid corruption issues"""
         try:
+            # Check if we should preserve Neo4j data
+            preserve_data = os.environ.get('PRESERVE_NEO4J_DATA', 'True').lower() == 'true'
+            
+            # Check for a preservation marker file
+            preserve_marker = os.path.join(self.base_path, "Neo4jDB", ".preserve")
+            if os.path.exists(preserve_marker):
+                preserve_data = True
+                
+            if preserve_data:
+                log_message("Neo4j data preservation is enabled. Only removing lock files...")
+                
+                # Clean up store_lock files that can cause lock issues
+                data_dir = os.path.join(self.base_path, "Neo4jDB", "data")
+                if os.path.exists(data_dir):
+                    # Remove only lock files that might be causing issues
+                    for root, dirs, files in os.walk(data_dir):
+                        for file in files:
+                            if file == "store_lock" or file.endswith(".lock"):
+                                lock_file = os.path.join(root, file)
+                                try:
+                                    os.remove(lock_file)
+                                    log_message(f"Removed lock file: {lock_file}")
+                                except Exception as e:
+                                    log_message(f"Error removing lock file {lock_file}: {str(e)}", True)
+                
+                log_message("Lock files cleanup completed (database preserved)")
+                return True
+            
+            # If not preserving data, proceed with full cleanup
             log_message("Cleaning up database files to resolve potential corruption...")
             
             # Clean up store_lock files that can cause lock issues
@@ -2531,42 +2867,42 @@ class ResearchAssistantApp(wx.Frame):
     def _start_neo4j_server_with_retry(self):
         """Start Neo4j server with retry logic"""
         max_retries = 3
-        timeout_seconds = 180  # Increased timeout to 180 seconds (3 minutes) for slower systems
         
-        # Create a flag to track timeout
+        # Set timeout for Neo4j startup
         self.neo4j_startup_timed_out = False
         
+        # Create timeout event
         def timeout_handler():
-            """Function that runs when timeout occurs"""
-            log_message("Neo4j server startup TIMED OUT after waiting too long", True)
+            log_message("Neo4j server startup timed out", True)
             self.neo4j_startup_timed_out = True
             
-            # Kill the Neo4j process if it's running
-            if hasattr(self, 'neo4j_server') and self.neo4j_server and hasattr(self.neo4j_server, 'process') and self.neo4j_server.process:
-                try:
-                    log_message("Killing Neo4j process due to timeout", True)
-                    self.neo4j_server.process.kill()
-                    self.neo4j_server.running = False
-                except Exception as e:
-                    log_message(f"Error killing Neo4j process: {str(e)}", True)
-            
-            # Post failure event to main thread
-            wx.PostEvent(self, DbInitEvent(success=False, error="Neo4j server startup timed out"))
+            # Post event to main thread
+            if hasattr(self, 'db_init_complete_callback') and self.db_init_complete_callback:
+                wx.PostEvent(self, DbInitEvent(success=False, error="Neo4j server startup timed out"))
         
-        # Set up the timeout timer
-        timer = threading.Timer(timeout_seconds, timeout_handler)
-        timer.daemon = True
-        timer.start()
+        # Start timeout timer
+        timeout = threading.Timer(120, timeout_handler)
+        timeout.daemon = True
+        timeout.start()
         
         try:
+            # Check if we should preserve Neo4j data
+            preserve_data = os.environ.get('PRESERVE_NEO4J_DATA', 'True').lower() == 'true'
+            
+            # Check for a preservation marker file
+            preserve_marker = os.path.join(APP_PATH, "Neo4jDB", ".preserve")
+            if os.path.exists(preserve_marker):
+                preserve_data = True
+                log_message("Neo4j data preservation marker file found")
+                
             for attempt in range(max_retries):
                 # Check if timeout occurred
                 if self.neo4j_startup_timed_out:
                     log_message("Aborting Neo4j startup due to timeout", True)
                     return
                 
-                # For first attempt, do a complete reset since we've changed Neo4j version
-                if attempt == 0:
+                # For first attempt, do a complete reset only if not preserving data
+                if attempt == 0 and not preserve_data:
                     log_message("Performing complete Neo4j server reset for version upgrade...")
                     self.neo4j_server.stop()
                     
@@ -2579,6 +2915,12 @@ class ResearchAssistantApp(wx.Frame):
                             log_message(f"Error removing Neo4j directory: {str(e)}", True)
                             
                     # Clean up any database files
+                    self.neo4j_server.cleanup_database_files()
+                elif attempt == 0 and preserve_data:
+                    log_message("Neo4j data preservation is enabled, skipping server reset...")
+                    # Just ensure the server is stopped
+                    self.neo4j_server.stop()
+                    # Only clean up lock files
                     self.neo4j_server.cleanup_database_files()
                 
                 # Start the Neo4j server
@@ -2605,50 +2947,65 @@ class ResearchAssistantApp(wx.Frame):
                         # Test connection
                         connection_retries = 3
                         for conn_attempt in range(connection_retries):
-                            if self.db_manager.connected:
-                                log_message(f"Neo4j database connection successful on attempt {conn_attempt+1}")
-                                # Cancel the timeout timer as we've succeeded
-                                timer.cancel()
-                                # Initialize embeddings and vector store
-                                self.initialize_embeddings()
+                            try:
+                                if self.db_manager.connect():
+                                    log_message("Connected to Neo4j database successfully")
+                                    
+                                    # Initialize embeddings
+                                    self.initialize_embeddings()
+                                    
+                                    # Cancel timeout
+                                    timeout.cancel()
+                                    
+                                    # Signal that initialization is complete
+                                    if hasattr(self, 'db_init_complete_callback') and self.db_init_complete_callback:
+                                        wx.PostEvent(self, DbInitEvent(success=True))
+                                    
+                                    return True
+                                else:
+                                    log_message(f"Database connection test failed on attempt {conn_attempt+1}/{connection_retries}", True)
+                            except Exception as e:
+                                log_message(f"Error testing database connection on attempt {conn_attempt+1}/{connection_retries}: {str(e)}", True)
                                 
-                                # Post success event to main thread
-                                wx.PostEvent(self, DbInitEvent(success=True))
-                                return
-                            else:
-                                log_message(f"Connection attempt {conn_attempt+1} failed, retrying...")
-                                time.sleep(3)
-                                # Try to reconnect
-                                self.db_manager.connect()
-                        
-                        log_message("Neo4j manager could not connect to server after multiple attempts", True)
+                            # Short delay before next connection attempt
+                            time.sleep(2)
                     except Exception as e:
-                        log_message(f"Error connecting to Neo4j server: {str(e)}", True)
-                    
-                    # Check if timeout occurred
-                    if self.neo4j_startup_timed_out:
-                        log_message("Aborting Neo4j retry due to timeout", True)
-                        return
+                        log_message(f"Error initializing database manager: {str(e)}", True)
+                        log_message(traceback.format_exc(), True)
                 
-                # If we get here, the server failed to start or connect properly
-                log_message(f"Neo4j server startup attempt {attempt+1}/{max_retries} failed", True)
+                # If we got here, there was a problem with this attempt
+                log_message(f"Neo4j startup attempt {attempt+1}/{max_retries} failed, retrying...", True)
                 
-                # Stop the server if it's running but having issues
-                if self.neo4j_server.running:
-                    self.neo4j_server.stop()
-                    
-                # Wait before retrying
-                if attempt < max_retries - 1:
-                    log_message("Waiting before retry...")
-                    time.sleep(5)
+                # Stop any running server
+                self.neo4j_server.stop()
+                
+                # Wait before next attempt
+                time.sleep(3)
             
-            # If we get here, all attempts failed
-            log_message("Failed to start Neo4j server, database features will be disabled", True)
-            # Post failure event to main thread
-            wx.PostEvent(self, DbInitEvent(success=False, error="Failed to start Neo4j server"))
-        finally:
-            # Make sure to cancel the timer to avoid issues
-            timer.cancel()
+            # If we got here, all attempts failed
+            log_message("All Neo4j startup attempts failed", True)
+            
+            # Signal failure
+            if hasattr(self, 'db_init_complete_callback') and self.db_init_complete_callback:
+                wx.PostEvent(self, DbInitEvent(success=False, error="Failed to start Neo4j server after multiple attempts"))
+                
+            # Cancel timeout
+            timeout.cancel()
+            
+            return False
+            
+        except Exception as e:
+            log_message(f"Error in Neo4j startup process: {str(e)}", True)
+            log_message(traceback.format_exc(), True)
+            
+            # Signal failure
+            if hasattr(self, 'db_init_complete_callback') and self.db_init_complete_callback:
+                wx.PostEvent(self, DbInitEvent(success=False, error=f"Error: {str(e)}"))
+                
+            # Cancel timeout
+            timeout.cancel()
+            
+            return False
     
     def initialize_embeddings(self):
         """Initialize embeddings and vector store"""
@@ -2783,36 +3140,20 @@ class ResearchAssistantApp(wx.Frame):
     def install_java_for_neo4j(self):
         """Install Java 11 for Neo4j - safe for UI threading"""
         try:
-            # Create a status dialog that doesn't block but shows progress
-            status_dialog = wx.MessageDialog(
-                self,
-                "Java installation process has started...\n"
-                "This may take several minutes.\n\n"
-                "The application will display a message when complete.",
-                "Installing Java",
-                wx.OK | wx.ICON_INFORMATION
-            )
-            status_dialog.ShowModal()
-            status_dialog.Destroy()
-            
-            # Run the installer in a background thread
+            # Start Java installation in a background thread
             def run_installer():
+                log_message("Starting automatic Java 11 installation...")
                 success = self.neo4j_server.install_java()
                 
                 # Use wx.CallAfter to update UI from the main thread
                 if success:
-                    wx.CallAfter(
-                        wx.MessageBox,
-                        "Java installation completed successfully.\n"
-                        "The application will now restart to apply changes.",
-                        "Installation Complete",
-                        wx.OK | wx.ICON_INFORMATION
-                    )
+                    log_message("Java installation completed successfully")
                     wx.CallAfter(self.restart_application)
                 else:
+                    log_message("Failed to install Java 11", True)
                     wx.CallAfter(
                         wx.MessageBox,
-                        "Failed to install Java.\n"
+                        "Failed to install Java 11.\n"
                         "You can continue using the application without Neo4j features,\n"
                         "or install Java 11 manually and restart the application.",
                         "Installation Failed",

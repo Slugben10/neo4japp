@@ -49,7 +49,7 @@ missing_packages = []
 
 for package in required_packages:
     try:
-        importlib.import_module(package)
+        importlib.import_module(package.split('>=')[0].split('<=')[0])  # Handle version constraints in package names
         print(f"✓ {package} is installed")
     except ImportError:
         missing_packages.append(package)
@@ -104,12 +104,35 @@ if not os.path.exists("config.json"):
         },
         "default_model": "openai",
         "max_tokens": 8000,
-        "system_prompt": "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions."
+        "system_prompt": "You are a helpful AI research assistant. Your goal is to help researchers write new papers or expand work-in-progress papers based on the provided documents and instructions.",
+        "preserve_neo4j_data": True,  # Add flag to preserve Neo4j data between runs
+        "download_neo4j_if_missing": True  # Add flag to download Neo4j if not found
     }
     
     with open("config.json", "w") as f:
         json.dump(default_config, f, indent=2)
     print("Default config.json created successfully")
+else:
+    # Update existing config with Neo4j preservation settings if missing
+    try:
+        with open("config.json", "r") as f:
+            config = json.load(f)
+        
+        updated = False
+        if "preserve_neo4j_data" not in config:
+            config["preserve_neo4j_data"] = True
+            updated = True
+            
+        if "download_neo4j_if_missing" not in config:
+            config["download_neo4j_if_missing"] = True
+            updated = True
+            
+        if updated:
+            with open("config.json", "w") as f:
+                json.dump(config, f, indent=2)
+            print("Updated config.json with Neo4j preservation settings")
+    except Exception as e:
+        print(f"Error updating config.json: {e}")
 
 # Create runtime hooks directory if it doesn't exist
 if not os.path.exists("hooks"):
@@ -150,12 +173,68 @@ with open(app_hook_path, 'w') as f:
 # General application hook
 import os
 import sys
+import json
 
 # Ensure we can find the app's resources
 if getattr(sys, 'frozen', False):
     # Running as a bundled executable
     APP_PATH = os.path.dirname(sys.executable)
     os.environ['RA_APP_PATH'] = APP_PATH
+    
+    # Load configuration to check Neo4j preservation settings
+    config_path = os.path.join(APP_PATH, 'config.json')
+    if os.path.exists(config_path):
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                
+            # Set environment variables for Neo4j preservation
+            if config.get('preserve_neo4j_data', True):
+                os.environ['PRESERVE_NEO4J_DATA'] = 'True'
+            else:
+                os.environ['PRESERVE_NEO4J_DATA'] = 'False'
+                
+            if config.get('download_neo4j_if_missing', True):
+                os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
+            else:
+                os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'False'
+        except Exception:
+            # Default to preserving data if config can't be loaded
+            os.environ['PRESERVE_NEO4J_DATA'] = 'True'
+            os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
+    else:
+        # Default to preserving data if config doesn't exist
+        os.environ['PRESERVE_NEO4J_DATA'] = 'True'
+        os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
+""")
+
+# Create Neo4j specific hook for bundling
+neo4j_hook_path = os.path.join("hooks", "hook-neo4j-bundling.py")
+with open(neo4j_hook_path, 'w') as f:
+    f.write("""
+# Neo4j bundling hook
+import os
+import sys
+import shutil
+
+# If we're frozen (in the final executable)
+if getattr(sys, 'frozen', False):
+    APP_PATH = os.path.dirname(sys.executable)
+    
+    # Define Neo4j paths
+    NEO4J_PATH = os.path.join(APP_PATH, 'Neo4jDB')
+    
+    # Create Neo4j directory if it doesn't exist
+    os.makedirs(NEO4J_PATH, exist_ok=True)
+    
+    # Create a marker file to indicate this is a bundled Neo4j
+    marker_path = os.path.join(NEO4J_PATH, '.bundled')
+    with open(marker_path, 'w') as f:
+        f.write('This directory contains a Neo4j database bundled with the application.')
+        
+    # Set environment variable to indicate Neo4j is bundled
+    os.environ['NEO4J_BUNDLED'] = 'True'
+    os.environ['NEO4J_DB_PATH'] = NEO4J_PATH
 """)
 
 # Create macOS specific hook for path detection
@@ -189,11 +268,23 @@ data_files = [
     ("config.json", "."),
     ("install_java.py", "."),  # Include Java installer script
     ("force_java_config.py", "."),  # Include Java force config script
+    ("download_neo4j.py", "."),  # Include Neo4j downloader script
 ]
 
 # Add .env file if it exists
 if os.path.exists(".env"):
     data_files.append((".env", "."))
+
+# Copy Neo4j files if they exist
+neo4j_dir = os.path.join('Neo4jDB')
+if os.path.exists(neo4j_dir) and os.path.isdir(neo4j_dir):
+    # Add Neo4jDB directory structure - will be properly handled during build
+    for root, dirs, files in os.walk(neo4j_dir):
+        for file in files:
+            full_path = os.path.join(root, file)
+            rel_path = os.path.relpath(full_path)
+            data_files.append((rel_path, os.path.dirname(rel_path)))
+    print(f"Added Neo4j database files from {neo4j_dir}")
 
 # Ensure the jre directory exists in the output folder
 dist_dir = os.path.join('dist', APP_NAME)
@@ -289,6 +380,7 @@ pyinstaller_args = [
 # Add runtime hooks
 pyinstaller_args.append('--runtime-hook=hooks/hook-app.py')
 pyinstaller_args.append('--runtime-hook=hooks/hook-macos-paths.py')
+pyinstaller_args.append('--runtime-hook=hooks/hook-neo4j-bundling.py')
 
 # Add additional hooks directory
 pyinstaller_args.append('--additional-hooks-dir=hooks')
@@ -344,6 +436,12 @@ try:
     neo4jdb_dir = os.path.join(dist_dir, 'Neo4jDB')
     os.makedirs(neo4jdb_dir, exist_ok=True)
     
+    # Create a Neo4j preservation marker file
+    neo4j_marker = os.path.join(neo4jdb_dir, '.preserve')
+    with open(neo4j_marker, 'w') as f:
+        f.write("This file indicates that Neo4j data should be preserved between application runs.\n")
+        f.write("Delete this file if you want to reset the database on next startup.\n")
+    
     # Ensure the Prompts directory exists in the output folder
     prompts_dir = os.path.join(dist_dir, 'Prompts')
     os.makedirs(prompts_dir, exist_ok=True)
@@ -368,6 +466,11 @@ try:
     if os.path.exists('.env'):
         shutil.copy('.env', dist_dir)
         print(f"Copied .env to {dist_dir}")
+        
+    # Copy Neo4j-related files
+    if os.path.exists('download_neo4j.py'):
+        shutil.copy('download_neo4j.py', dist_dir)
+        print(f"Copied download_neo4j.py to {dist_dir}")
 
     # For macOS, perform additional compatibility fixes
     if sys.platform == 'darwin':
@@ -394,6 +497,12 @@ try:
                 neo4jdb_path = os.path.join(dest_path, "Neo4jDB")
                 os.makedirs(neo4jdb_path, exist_ok=True)
                 print(f"Created Neo4jDB directory at: {neo4jdb_path}")
+                
+                # Create Neo4j preservation marker file
+                neo4j_marker = os.path.join(neo4jdb_path, '.preserve')
+                with open(neo4j_marker, 'w') as f:
+                    f.write("This file indicates that Neo4j data should be preserved between application runs.\n")
+                    f.write("Delete this file if you want to reset the database on next startup.\n")
                 
                 # Create Prompts directory
                 prompts_path = os.path.join(dest_path, "Prompts")
@@ -430,6 +539,13 @@ try:
                 # Make it executable
                 os.chmod(os.path.join(dest_path, 'force_java_config.py'), 0o755)
                 print(f"Copied force_java_config.py to {dest_path}")
+                
+            # Copy download_neo4j.py to ensure it's available
+            if os.path.exists('download_neo4j.py'):
+                shutil.copy('download_neo4j.py', dest_path)
+                # Make it executable
+                os.chmod(os.path.join(dest_path, 'download_neo4j.py'), 0o755)
+                print(f"Copied download_neo4j.py to {dest_path}")
             
             # Copy .env to multiple locations
             if os.path.exists('.env'):
@@ -468,6 +584,7 @@ echo "Fix completed. Try running the app again."
 
     print(f"Build complete. Executable is in {dist_dir}")
     print(f"Documents directory created at {documents_dir}")
+    print(f"Neo4j database directory created at {neo4jdb_dir} with preservation enabled")
     
 except Exception as e:
     print(f"Error during build process: {e}")
