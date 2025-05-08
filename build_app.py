@@ -166,49 +166,103 @@ elif sys.platform == 'win32':
     hiddenimports.extend(['wx.msw'])
 """)
 
-# Create general app hook
+# Create app initialization hook with improved path handling for app bundles
 app_hook_path = os.path.join("hooks", "hook-app.py")
 with open(app_hook_path, 'w') as f:
     f.write("""
-# General application hook
+# Application initialization hook
 import os
 import sys
 import json
+import logging
+import platform
 
-# Ensure we can find the app's resources
+def setup_logging():
+    # Configure logging
+    log_format = "[INFO] %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    logger = logging.getLogger()
+    return logger
+
+logger = setup_logging()
+logger.info(f"Initializing application runtime hook in {__file__}")
+
+# Find the correct app path based on platform and frozen state
 if getattr(sys, 'frozen', False):
-    # Running as a bundled executable
-    APP_PATH = os.path.dirname(sys.executable)
-    os.environ['RA_APP_PATH'] = APP_PATH
-    
+    # Running in a bundle
+    if sys.platform == 'darwin':  # macOS
+        # macOS app bundles have a different structure
+        # Check various possible locations for the executable
+        logger.info(f"Running as macOS app bundle")
+        bundle_base = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+        logger.info(f"Bundle base path: {bundle_base}")
+        
+        app_paths = [
+            os.path.dirname(sys.executable),  # MacOS/
+            os.path.join(os.path.dirname(os.path.dirname(sys.executable)), 'Resources'),  # Resources/
+            bundle_base,  # Base .app directory
+        ]
+        
+        # Find first path containing necessary directories or files
+        APP_PATH = None
+        for path in app_paths:
+            logger.info(f"Checking path: {path}")
+            if os.path.exists(path) and (
+                os.path.exists(os.path.join(path, 'Neo4jDB')) or 
+                os.path.exists(os.path.join(path, 'config.json')) or
+                os.path.exists(os.path.join(path, 'Documents'))
+            ):
+                APP_PATH = path
+                logger.info(f"Using path: {APP_PATH}")
+                break
+                
+        if APP_PATH is None:
+            # Fallback to default locations
+            APP_PATH = bundle_base
+            logger.info(f"Using fallback path: {APP_PATH}")
+            
+        # Create core directories if they don't exist 
+        os.makedirs(os.path.join(APP_PATH, "Documents"), exist_ok=True)
+        os.makedirs(os.path.join(APP_PATH, "Neo4jDB"), exist_ok=True)
+        os.makedirs(os.path.join(APP_PATH, "Prompts"), exist_ok=True)
+        os.makedirs(os.path.join(APP_PATH, "jre"), exist_ok=True)
+        
+        # Set environment variables to help find resources
+        os.environ['RA_APP_PATH'] = APP_PATH
+        os.environ['RA_BUNDLE_PATH'] = bundle_base
+        os.environ['RA_RESOURCES_PATH'] = os.path.join(bundle_base, 'Resources')
+        os.environ['RA_MACOS_PATH'] = os.path.join(bundle_base, 'MacOS')
+                
+    else:  # Windows/Linux
+        APP_PATH = os.path.dirname(sys.executable)
+        logger.info(f"Running as frozen application: {APP_PATH}")
+        os.environ['RA_APP_PATH'] = APP_PATH
+        
     # Load configuration to check Neo4j preservation settings
     config_path = os.path.join(APP_PATH, 'config.json')
     if os.path.exists(config_path):
         try:
+            logger.info(f"Loading config from: {config_path}")
             with open(config_path, 'r') as f:
                 config = json.load(f)
                 
             # Set environment variables for Neo4j preservation
-            if config.get('preserve_neo4j_data', True):
-                os.environ['PRESERVE_NEO4J_DATA'] = 'True'
-            else:
-                os.environ['PRESERVE_NEO4J_DATA'] = 'False'
-                
-            if config.get('download_neo4j_if_missing', True):
-                os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
-            else:
-                os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'False'
-        except Exception:
+            os.environ['PRESERVE_NEO4J_DATA'] = 'True' if config.get('preserve_neo4j_data', True) else 'False'
+            os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True' if config.get('download_neo4j_if_missing', True) else 'False'
+            logger.info(f"Neo4j preservation: {os.environ['PRESERVE_NEO4J_DATA']}")
+        except Exception as e:
+            logger.info(f"Error loading config: {e}")
             # Default to preserving data if config can't be loaded
             os.environ['PRESERVE_NEO4J_DATA'] = 'True'
             os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
     else:
+        logger.info(f"Config file not found at: {config_path}")
         # Default to preserving data if config doesn't exist
         os.environ['PRESERVE_NEO4J_DATA'] = 'True'
         os.environ['DOWNLOAD_NEO4J_IF_MISSING'] = 'True'
 """)
 
-# Create Neo4j specific hook for bundling
+# Create Neo4j specific hook with improved path handling
 neo4j_hook_path = os.path.join("hooks", "hook-neo4j-bundling.py")
 with open(neo4j_hook_path, 'w') as f:
     f.write("""
@@ -216,51 +270,66 @@ with open(neo4j_hook_path, 'w') as f:
 import os
 import sys
 import shutil
+import logging
+import platform
 
-# If we're frozen (in the final executable)
+def setup_logging():
+    # Configure logging
+    log_format = "[INFO] %(message)s"
+    logging.basicConfig(level=logging.INFO, format=log_format)
+    logger = logging.getLogger()
+    return logger
+
+logger = setup_logging()
+logger.info("Initializing Neo4j bundling hook")
+
+# Find the correct app path based on platform and frozen state
 if getattr(sys, 'frozen', False):
-    APP_PATH = os.path.dirname(sys.executable)
+    if sys.platform == 'darwin':  # macOS
+        # macOS app bundles have a different structure
+        # Use the environment variable from the app hook if available
+        APP_PATH = os.environ.get('RA_APP_PATH')
+        if not APP_PATH:
+            bundle_base = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
+            APP_PATH = bundle_base
+            logger.info(f"Using bundle base path for Neo4j: {APP_PATH}")
+    else:
+        APP_PATH = os.path.dirname(sys.executable)
+        logger.info(f"Using executable directory for Neo4j: {APP_PATH}")
     
     # Define Neo4j paths
     NEO4J_PATH = os.path.join(APP_PATH, 'Neo4jDB')
+    logger.info(f"Setting Neo4j path to: {NEO4J_PATH}")
     
     # Create Neo4j directory if it doesn't exist
     os.makedirs(NEO4J_PATH, exist_ok=True)
+    logger.info(f"Created Neo4j directory: {NEO4J_PATH}")
+    
+    # Create Neo4j subdirectories
+    os.makedirs(os.path.join(NEO4J_PATH, 'data'), exist_ok=True)
+    os.makedirs(os.path.join(NEO4J_PATH, 'logs'), exist_ok=True)
+    os.makedirs(os.path.join(NEO4J_PATH, 'conf'), exist_ok=True)
     
     # Create a marker file to indicate this is a bundled Neo4j
     marker_path = os.path.join(NEO4J_PATH, '.bundled')
     with open(marker_path, 'w') as f:
         f.write('This directory contains a Neo4j database bundled with the application.')
-        
-    # Set environment variable to indicate Neo4j is bundled
+    
+    # Create a marker file to preserve data between runs
+    preserve_path = os.path.join(NEO4J_PATH, '.preserve')
+    with open(preserve_path, 'w') as f:
+        f.write('This file indicates that Neo4j data should be preserved between application runs.')
+    
+    # Set environment variables for Neo4j
     os.environ['NEO4J_BUNDLED'] = 'True'
     os.environ['NEO4J_DB_PATH'] = NEO4J_PATH
-""")
-
-# Create macOS specific hook for path detection
-macos_hook_path = os.path.join("hooks", "hook-macos-paths.py")
-with open(macos_hook_path, 'w') as f:
-    f.write("""
-# macOS specific path detection hook
-import os
-import sys
-
-# Add different possible paths for resources when in a macOS bundle
-if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
-    # We're in a macOS app bundle
-    bundle_path = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
-    resources_path = os.path.join(bundle_path, 'Resources')
-    macos_path = os.path.join(bundle_path, 'MacOS')
     
-    # Add these paths to sys.path to help with imports
-    sys.path.insert(0, bundle_path)
-    sys.path.insert(0, resources_path)
-    sys.path.insert(0, macos_path)
+    # Add JRE directory for Neo4j
+    JRE_PATH = os.path.join(APP_PATH, 'jre')
+    os.makedirs(JRE_PATH, exist_ok=True)
+    os.environ['NEO4J_JRE_PATH'] = JRE_PATH
     
-    # Set environment variables to help find resources
-    os.environ['RA_BUNDLE_PATH'] = bundle_path
-    os.environ['RA_RESOURCES_PATH'] = resources_path
-    os.environ['RA_MACOS_PATH'] = macos_path
+    logger.info(f"Neo4j environment setup complete")
 """)
 
 # Define data files to include
@@ -286,19 +355,6 @@ if os.path.exists(neo4j_dir) and os.path.isdir(neo4j_dir):
             data_files.append((rel_path, os.path.dirname(rel_path)))
     print(f"Added Neo4j database files from {neo4j_dir}")
 
-# Ensure the jre directory exists in the output folder
-dist_dir = os.path.join('dist', APP_NAME)
-jre_dir = os.path.join(dist_dir, 'jre')
-os.makedirs(jre_dir, exist_ok=True)
-
-# Ensure that the install_java.py script is executable
-if os.path.exists("install_java.py"):
-    try:
-        if sys.platform != 'win32':  # Unix-like systems
-            os.chmod("install_java.py", 0o755)
-    except Exception as e:
-        print(f"Warning: Could not make install_java.py executable: {e}")
-
 # Define hidden imports based on what's used in main.py
 hidden_imports = [
     "wx",
@@ -323,6 +379,7 @@ hidden_imports = [
     "langchain_openai",
     "langchain_neo4j",
     "langchain_community.vectorstores",
+    "langchain_community.vectorstores.neo4j_vector",
     "langchain_community.document_loaders",
     "langchain_community.document_loaders.pdf",
     "langchain_community.document_loaders.text",
@@ -353,20 +410,6 @@ try:
 except ImportError:
     print("Warning: pypdf not installed. PDF support will be limited.")
 
-# Additional wxPython-specific imports
-wxpy_modules = [
-    "wx.adv",
-    "wx.html",
-    "wx.grid",
-    "wx.xrc",
-    "wx._xml",
-    "wx._html",
-    "wx._adv",
-    "wx._core",
-    "wx._controls"
-]
-hidden_imports.extend(wxpy_modules)
-
 # Base PyInstaller arguments
 pyinstaller_args = [
     'main.py',
@@ -374,12 +417,13 @@ pyinstaller_args = [
     '--onedir',
     '--clean',
     '--noconfirm',
-    '--noconsole',  # Elrejtjük a konzolablakot
 ]
+
+if sys.platform == 'darwin':  # Only hide console in macOS
+    pyinstaller_args.append('--noconsole')  # Hide console window in macOS
 
 # Add runtime hooks
 pyinstaller_args.append('--runtime-hook=hooks/hook-app.py')
-pyinstaller_args.append('--runtime-hook=hooks/hook-macos-paths.py')
 pyinstaller_args.append('--runtime-hook=hooks/hook-neo4j-bundling.py')
 
 # Add additional hooks directory
@@ -399,11 +443,6 @@ if sys.platform == 'darwin':  # macOS
     pyinstaller_args.append('--windowed')
     pyinstaller_args.append('--osx-bundle-identifier=com.researchassistant.app')
     
-    # Exclude modules that might cause conflicts
-    pyinstaller_args.append('--exclude-module=tkinter')
-    pyinstaller_args.append('--exclude-module=PySide')
-    pyinstaller_args.append('--exclude-module=PyQt5')
-    
     # Add icon if available
     if os.path.exists('app_icon.icns'):
         pyinstaller_args.append('--icon=app_icon.icns')
@@ -412,9 +451,6 @@ elif sys.platform == 'win32':  # Windows
     
     # Add specific Windows options for wxPython
     pyinstaller_args.append('--hidden-import=wx.msw')
-    
-    # Windows-specifikus opciók az antivírus-jelzések elkerülésére
-    pyinstaller_args.append('--uac-admin')
     
     # Add icon if available
     if os.path.exists('app_icon.ico'):
@@ -427,179 +463,159 @@ try:
     # Run PyInstaller
     pyinstaller_main.run(pyinstaller_args)
 
-    # Ensure the Documents directory exists in the output folder
+    # Set up the required directories in various locations
     dist_dir = os.path.join('dist', APP_NAME)
-    documents_dir = os.path.join(dist_dir, 'Documents')
-    os.makedirs(documents_dir, exist_ok=True)
     
-    # Ensure the Neo4jDB directory exists in the output folder
-    neo4jdb_dir = os.path.join(dist_dir, 'Neo4jDB')
-    os.makedirs(neo4jdb_dir, exist_ok=True)
+    # Ensure core directories exist in the output folder
+    directories = ['Documents', 'Neo4jDB', 'Neo4jDB/data', 'Neo4jDB/logs', 'Prompts', 'jre']
+    for directory in directories:
+        dir_path = os.path.join(dist_dir, directory)
+        os.makedirs(dir_path, exist_ok=True)
+        print(f"Created directory: {dir_path}")
     
     # Create a Neo4j preservation marker file
-    neo4j_marker = os.path.join(neo4jdb_dir, '.preserve')
+    neo4j_marker = os.path.join(dist_dir, 'Neo4jDB', '.preserve')
     with open(neo4j_marker, 'w') as f:
         f.write("This file indicates that Neo4j data should be preserved between application runs.\n")
         f.write("Delete this file if you want to reset the database on next startup.\n")
     
-    # Ensure the Prompts directory exists in the output folder
-    prompts_dir = os.path.join(dist_dir, 'Prompts')
-    os.makedirs(prompts_dir, exist_ok=True)
-    
-    # Ensure the jre directory exists in the output folder
-    jre_dir = os.path.join(dist_dir, 'jre')
-    os.makedirs(jre_dir, exist_ok=True)
-    
-    # Create a README file in the jre directory
-    jre_readme_path = os.path.join(jre_dir, 'README.txt')
+    # Create a JRE README
+    jre_readme_path = os.path.join(dist_dir, 'jre', 'README.txt')
     with open(jre_readme_path, 'w') as f:
         f.write("This directory will contain a Java Runtime Environment (JRE) for Neo4j.\n")
         f.write("If you experience issues with Neo4j, the application will help you install Java here.\n")
         f.write("You can also run install_java.py manually to install Java.\n")
 
-    # Explicitly copy config.json to the output folder to ensure it's available
-    if os.path.exists('config.json'):
-        shutil.copy('config.json', dist_dir)
-        print(f"Copied config.json to {dist_dir}")
+    # Copy key files to the output folder
+    key_files = ['config.json', '.env', 'download_neo4j.py', 'install_java.py', 'force_java_config.py']
+    for file in key_files:
+        if os.path.exists(file):
+            shutil.copy(file, dist_dir)
+            print(f"Copied {file} to {dist_dir}")
+            # Make executable if script
+            if file.endswith('.py'):
+                try:
+                    if sys.platform != 'win32':  # Unix-like systems
+                        os.chmod(os.path.join(dist_dir, file), 0o755)
+                except Exception as e:
+                    print(f"Warning: Could not make {file} executable: {e}")
 
-    # Copy .env file to dist folder (if it exists)
-    if os.path.exists('.env'):
-        shutil.copy('.env', dist_dir)
-        print(f"Copied .env to {dist_dir}")
-        
-    # Copy Neo4j-related files
-    if os.path.exists('download_neo4j.py'):
-        shutil.copy('download_neo4j.py', dist_dir)
-        print(f"Copied download_neo4j.py to {dist_dir}")
-
-    # For macOS, perform additional compatibility fixes
+    # For macOS, perform additional fixes for app bundle
     if sys.platform == 'darwin':
         app_bundle_path = os.path.join('dist', f"{APP_NAME}.app")
         if os.path.exists(app_bundle_path):
-            print(f"Performing additional macOS compatibility fixes for {app_bundle_path}...")
+            print(f"Setting up macOS app bundle: {app_bundle_path}")
             
-            # Ensure config.json and .env are copied into the app bundle at multiple locations
+            # Get app bundle subdirectories
             contents_path = os.path.join(app_bundle_path, "Contents")
             macos_path = os.path.join(contents_path, "MacOS")
             resources_path = os.path.join(contents_path, "Resources")
             
-            # Create directories if they don't exist
-            os.makedirs(macos_path, exist_ok=True)
-            os.makedirs(resources_path, exist_ok=True)
-            
-            # Create Documents directory in multiple locations
-            for dest_path in [macos_path, resources_path]:
-                doc_path = os.path.join(dest_path, "Documents")
-                os.makedirs(doc_path, exist_ok=True)
-                print(f"Created Documents directory at: {doc_path}")
+            # Ensure core directories exist in both MacOS and Resources
+            for base_dir in [macos_path, resources_path]:
+                for directory in directories:
+                    dir_path = os.path.join(base_dir, directory)
+                    os.makedirs(dir_path, exist_ok=True)
+                    print(f"Created directory: {dir_path}")
                 
-                # Create Neo4jDB directory
-                neo4jdb_path = os.path.join(dest_path, "Neo4jDB")
-                os.makedirs(neo4jdb_path, exist_ok=True)
-                print(f"Created Neo4jDB directory at: {neo4jdb_path}")
-                
-                # Create Neo4j preservation marker file
-                neo4j_marker = os.path.join(neo4jdb_path, '.preserve')
+                # Create Neo4j preservation marker
+                neo4j_marker = os.path.join(base_dir, 'Neo4jDB', '.preserve')
                 with open(neo4j_marker, 'w') as f:
                     f.write("This file indicates that Neo4j data should be preserved between application runs.\n")
-                    f.write("Delete this file if you want to reset the database on next startup.\n")
                 
-                # Create Prompts directory
-                prompts_path = os.path.join(dest_path, "Prompts")
-                os.makedirs(prompts_path, exist_ok=True)
-                print(f"Created Prompts directory at: {prompts_path}")
-                
-                # Create JRE directory
-                jre_path = os.path.join(dest_path, "jre")
-                os.makedirs(jre_path, exist_ok=True)
-                print(f"Created JRE directory at: {jre_path}")
-                
-                # Create README in JRE directory
-                jre_readme_path = os.path.join(jre_path, 'README.txt')
-                with open(jre_readme_path, 'w') as f:
+                # Create JRE README
+                jre_readme = os.path.join(base_dir, 'jre', 'README.txt')
+                with open(jre_readme, 'w') as f:
                     f.write("This directory will contain a Java Runtime Environment (JRE) for Neo4j.\n")
-                    f.write("If you experience issues with Neo4j, the application will help you install Java here.\n")
-            
-            # Copy config.json to multiple locations
-            for dest_path in [macos_path, resources_path]:
-                if os.path.exists('config.json'):
-                    shutil.copy('config.json', dest_path)
-                    print(f"Copied config.json to {dest_path}")
-            
-            # Copy install_java.py to ensure it's available
-            if os.path.exists('install_java.py'):
-                shutil.copy('install_java.py', dest_path)
-                # Make it executable
-                os.chmod(os.path.join(dest_path, 'install_java.py'), 0o755)
-                print(f"Copied install_java.py to {dest_path}")
-            
-            # Copy force_java_config.py to ensure it's available
-            if os.path.exists('force_java_config.py'):
-                shutil.copy('force_java_config.py', dest_path)
-                # Make it executable
-                os.chmod(os.path.join(dest_path, 'force_java_config.py'), 0o755)
-                print(f"Copied force_java_config.py to {dest_path}")
                 
-            # Copy download_neo4j.py to ensure it's available
-            if os.path.exists('download_neo4j.py'):
-                shutil.copy('download_neo4j.py', dest_path)
-                # Make it executable
-                os.chmod(os.path.join(dest_path, 'download_neo4j.py'), 0o755)
-                print(f"Copied download_neo4j.py to {dest_path}")
+                # Copy key files
+                for file in key_files:
+                    if os.path.exists(file):
+                        try:
+                            shutil.copy(file, base_dir)
+                            print(f"Copied {file} to {base_dir}")
+                            # Make executable if script
+                            if file.endswith('.py'):
+                                os.chmod(os.path.join(base_dir, file), 0o755)
+                        except Exception as e:
+                            print(f"Warning: Could not copy {file} to {base_dir}: {e}")
             
-            # Copy .env to multiple locations
-            if os.path.exists('.env'):
-                for dest_path in [macos_path, resources_path]:
-                    shutil.copy('.env', dest_path)
-                    print(f"Copied .env to {dest_path}")
-            
-            # Create a fixup script to run after installation
-            fixup_script = os.path.join(dist_dir, "fix_macos_app.sh")
-            with open(fixup_script, 'w') as f:
-                f.write("""#!/bin/bash
-# Fix for wxPython symbol issues on macOS
-# This script should be run after installation if you encounter issues
+            # Create a fixed entry point script to resolve path issues
+            entry_point_script = os.path.join(macos_path, f"{APP_NAME}_launcher.sh")
+            with open(entry_point_script, 'w') as f:
+                f.write(f"""#!/bin/bash
+# Launcher script for {APP_NAME} that fixes path issues
 
-APP_PATH="$(cd "$(dirname "$0")" && pwd)"
-echo "Fixing wxPython compatibility issues in: $APP_PATH"
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+APP_DIR="$( cd "$SCRIPT_DIR/../.." && pwd )"
+MACOS_DIR="$SCRIPT_DIR"
+RESOURCES_DIR="$( cd "$SCRIPT_DIR/../Resources" && pwd )"
 
-# Fix library paths if needed
-install_name_tool -change @loader_path/libwx_baseu-3.1.dylib @executable_path/libwx_baseu-3.1.dylib "$APP_PATH/wx/_core.so" 2>/dev/null || true
-install_name_tool -change @loader_path/libwx_osx_cocoau-3.1.dylib @executable_path/libwx_osx_cocoau-3.1.dylib "$APP_PATH/wx/_core.so" 2>/dev/null || true
+# Set up environment variables
+export RA_APP_PATH="$RESOURCES_DIR"
+export RA_BUNDLE_PATH="$APP_DIR"
+export RA_RESOURCES_PATH="$RESOURCES_DIR"
+export RA_MACOS_PATH="$MACOS_DIR"
+export NEO4J_DB_PATH="$RESOURCES_DIR/Neo4jDB"
+export NEO4J_BUNDLED="True"
+export NEO4J_JRE_PATH="$RESOURCES_DIR/jre"
+export PRESERVE_NEO4J_DATA="True"
+export DOWNLOAD_NEO4J_IF_MISSING="True"
 
-# Create symbolic links to ensure files can be found
-BUNDLE_DIR="$(dirname "$(dirname "$APP_PATH")")"
-echo "Creating symbolic links in bundle directory: $BUNDLE_DIR"
+# Create necessary directories
+mkdir -p "$RESOURCES_DIR/Neo4jDB/data"
+mkdir -p "$RESOURCES_DIR/Neo4jDB/logs"
+mkdir -p "$RESOURCES_DIR/Documents"
+mkdir -p "$RESOURCES_DIR/Prompts"
+mkdir -p "$RESOURCES_DIR/jre"
 
-# Link .env and config.json if they exist
-[ -f "$APP_PATH/.env" ] && ln -sf "$APP_PATH/.env" "$BUNDLE_DIR/.env" 2>/dev/null || true
-[ -f "$APP_PATH/config.json" ] && ln -sf "$APP_PATH/config.json" "$BUNDLE_DIR/config.json" 2>/dev/null || true
+# Copy config.json if it exists in MACOS_DIR but not in RESOURCES_DIR
+if [ -f "$MACOS_DIR/config.json" ] && [ ! -f "$RESOURCES_DIR/config.json" ]; then
+    cp "$MACOS_DIR/config.json" "$RESOURCES_DIR/config.json"
+fi
 
-echo "Fix completed. Try running the app again."
+# Copy .env if it exists in MACOS_DIR but not in RESOURCES_DIR
+if [ -f "$MACOS_DIR/.env" ] && [ ! -f "$RESOURCES_DIR/.env" ]; then
+    cp "$MACOS_DIR/.env" "$RESOURCES_DIR/.env"
+fi
+
+# Launch the actual application
+"$MACOS_DIR/{APP_NAME}" "$@"
 """)
             
-            # Make the script executable
-            os.chmod(fixup_script, 0o755)
-            print(f"Created macOS compatibility fix script at {fixup_script}")
+            # Make launcher script executable
+            os.chmod(entry_point_script, 0o755)
+            print(f"Created launcher script: {entry_point_script}")
+            
+            # Create a .command file that can be double-clicked to run the app in Terminal
+            terminal_launcher = os.path.join('dist', f"{APP_NAME}_terminal.command")
+            with open(terminal_launcher, 'w') as f:
+                f.write(f"""#!/bin/bash
+# Run {APP_NAME} with Terminal output for debugging
 
-    print(f"Build complete. Executable is in {dist_dir}")
-    print(f"Documents directory created at {documents_dir}")
-    print(f"Neo4j database directory created at {neo4jdb_dir} with preservation enabled")
+# Get the directory where this script is located
+SCRIPT_DIR="$( cd "$( dirname "${{BASH_SOURCE[0]}}" )" && pwd )"
+APP_PATH="$SCRIPT_DIR/{APP_NAME}.app/Contents/MacOS"
+
+echo "Starting {APP_NAME} with Terminal output..."
+"$APP_PATH/{APP_NAME}" "$@"
+""")
+            
+            # Make terminal launcher executable
+            os.chmod(terminal_launcher, 0o755)
+            print(f"Created terminal launcher: {terminal_launcher}")
+
+    print(f"Build complete! Executable is in {dist_dir}")
+    
+    # Final instructions
+    print("\nImportant post-build steps:")
+    if sys.platform == 'darwin':
+        print(f"1. If you encounter issues with the app bundle, try running '{APP_NAME}_terminal.command' for debugging output")
+        print(f"2. Ensure your .env file with API keys is properly placed in the app bundle")
+    print(f"3. Make sure Neo4j and Java are properly bundled or will be downloaded on first run")
     
 except Exception as e:
     print(f"Error during build process: {e}")
     import traceback
     traceback.print_exc()
-
-print("\nIf you encounter issues with the app:")
-print("1. Make sure wxPython is properly installed: pip install -U wxPython")
-print("2. Make sure PyInstaller and its dependencies are installed: pip install -U pyinstaller altgraph")
-print("3. Try running the app from terminal to see any error output")
-
-if sys.platform == 'darwin':
-    print("\nFor macOS-specific wxPython issues:")
-    print("1. Try running the fix_macos_app.sh script in the application directory")
-    print("2. Ensure you're using a compatible version of wxPython for your macOS version")
-    print("3. Consider using PyInstaller 4.10 or newer for better macOS compatibility")
-    print("4. If using the app bundle, try running it from the terminal with:")
-    print(f"   open -a {APP_NAME}")

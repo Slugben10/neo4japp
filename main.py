@@ -1789,9 +1789,6 @@ class EmbeddedNeo4jServer:
                     line = "dbms.memory.heap.max_size=2g\n"
                 elif line.strip().startswith('#dbms.memory.pagecache.size='):
                     line = "dbms.memory.pagecache.size=1g\n"
-                # Disable shell server to avoid port conflicts (1337) commonly seen on Mac
-                elif line.strip().startswith('#dbms.shell.enabled='):
-                    line = "dbms.shell.enabled=false\n"
                 
                 new_config_lines.append(line)
             
@@ -1815,10 +1812,6 @@ class EmbeddedNeo4jServer:
             new_config_lines.append("dbms.memory.pagecache.flush.buffer.size_in_pages=100\n")
             new_config_lines.append("dbms.tx_state.memory_allocation=ON_HEAP\n")
             new_config_lines.append("dbms.jvm.additional=-XX:+UseG1GC\n")
-            
-            # Explicitly disable shell server to prevent port conflicts on Mac (port 1337)
-            new_config_lines.append("\n# Disable shell server to prevent port conflicts\n")
-            new_config_lines.append("dbms.shell.enabled=false\n")
             
             # Add transaction and connection pool settings for faster batch operations
             new_config_lines.append("\n# Transaction and connection settings for faster batch operations\n")
