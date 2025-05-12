@@ -1,21 +1,17 @@
 
-# macOS specific path detection hook
+# Hook to help PyInstaller find resources in macOS app bundle
 import os
 import sys
 
-# Add different possible paths for resources when in a macOS bundle
-if getattr(sys, 'frozen', False) and sys.platform == 'darwin':
-    # We're in a macOS app bundle
-    bundle_path = os.path.dirname(os.path.dirname(os.path.dirname(sys.executable)))
-    resources_path = os.path.join(bundle_path, 'Resources')
-    macos_path = os.path.join(bundle_path, 'MacOS')
-    
-    # Add these paths to sys.path to help with imports
-    sys.path.insert(0, bundle_path)
-    sys.path.insert(0, resources_path)
-    sys.path.insert(0, macos_path)
-    
-    # Set environment variables to help find resources
-    os.environ['RA_BUNDLE_PATH'] = bundle_path
-    os.environ['RA_RESOURCES_PATH'] = resources_path
-    os.environ['RA_MACOS_PATH'] = macos_path
+# Set environment variables to help the app find its resources
+if getattr(sys, 'frozen', False):
+    # We're running in a bundle
+    bundle_dir = os.path.dirname(sys.executable)
+    if '.app/Contents/MacOS' in bundle_dir:
+        # We're in a macOS .app bundle
+        resources_dir = os.path.abspath(os.path.join(bundle_dir, '..', 'Resources'))
+        app_dir = os.path.abspath(os.path.join(bundle_dir, '..', '..', '..'))
+        
+        # Set environment variables
+        os.environ['RA_RESOURCES_PATH'] = resources_dir
+        os.environ['RA_APP_PATH'] = app_dir

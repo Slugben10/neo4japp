@@ -1903,6 +1903,10 @@ class EmbeddedNeo4jServer:
                     return False
                 log_message("Java 11 installed successfully, continuing with Neo4j startup")
             
+            # Fix Neo4j startup script on macOS before starting
+            if platform.system().lower() == "darwin":
+                self._fix_neo4j_startup_script()
+                
             # Kill any stale Java/Neo4j processes
             self.kill_stale_processes()
             
@@ -2382,6 +2386,68 @@ class EmbeddedNeo4jServer:
             log_message("Process cleanup completed")
         except Exception as e:
             log_message(f"Error while killing stale processes: {str(e)}", True)
+
+    def _fix_neo4j_startup_script(self):
+        """Fix common issues in Neo4j startup scripts for macOS"""
+        try:
+            # Check if the startup script exists
+            neo4j_script = os.path.join(self.server_dir, "bin", "neo4j")
+            if not os.path.exists(neo4j_script):
+                log_message("Neo4j startup script not found, skipping fix", True)
+                return False
+                
+            log_message("Checking Neo4j startup script for issues...")
+            
+            # Read the script content
+            with open(neo4j_script, 'r') as f:
+                script_lines = f.readlines()
+                
+            # Find and fix syntax errors in the Darwin section
+            fixed = False
+            in_darwin_section = False
+            darwin_section_start = -1
+            darwin_section_end = -1
+            
+            # First pass: identify Darwin section
+            for i, line in enumerate(script_lines):
+                line = line.strip()
+                if "Darwin*)" in line:
+                    in_darwin_section = True
+                    darwin_section_start = i
+                elif in_darwin_section and line.endswith(";;"):
+                    darwin_section_end = i
+                    break
+                    
+            # Fix the Darwin section if found
+            if darwin_section_start >= 0 and darwin_section_end >= 0:
+                # Replace the Darwin section with a fixed version
+                fixed_section = [
+                    '  Darwin*) darwin=true\n',
+                    '           if [ -z "$JAVA_VERSION" ] ; then\n',
+                    '             JAVA_VERSION="CurrentJDK"\n',
+                    '           else\n',
+                    '             echo "Using Java version: $JAVA_VERSION"\n',
+                    '           fi\n',
+                    '           # Use the bundled JRE directly\n',
+                    '           JAVA_HOME="' + os.path.join(APP_PATH, "jre", "Contents", "Home") + '"\n',
+                    '           ;;\n'
+                ]
+                
+                script_lines[darwin_section_start:darwin_section_end+1] = fixed_section
+                fixed = True
+                
+                # Write the fixed script back
+                with open(neo4j_script, 'w') as f:
+                    f.writelines(script_lines)
+                    
+                # Make sure the script is executable
+                os.chmod(neo4j_script, 0o755)
+                log_message("Fixed Neo4j startup script")
+                
+            return fixed
+        except Exception as e:
+            log_message(f"Error fixing Neo4j startup script: {str(e)}", True)
+            return False
 
 # Dialog for managing document priorities
 class DocumentPriorityDialog(wx.Dialog):
