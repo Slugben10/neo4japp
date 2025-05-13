@@ -395,6 +395,10 @@ hidden_imports = [
     "google.cloud.aiplatform",
     "langchain_google_genai",
     "langchain_anthropic",
+    # Add tiktoken and its extensions to fix "Unknown encoding cl100k_base" error
+    "tiktoken",
+    "tiktoken_ext",
+    "tiktoken_ext.openai_public",
 ]
 
 # Try to include optional packages
@@ -455,6 +459,11 @@ elif sys.platform == 'win32':  # Windows
     # Add icon if available
     if os.path.exists('app_icon.ico'):
         pyinstaller_args.append('--icon=app_icon.ico')
+
+# Add explicit tiktoken imports to fix "Unknown encoding cl100k_base" error
+pyinstaller_args.append('--hidden-import=tiktoken')
+pyinstaller_args.append('--hidden-import=tiktoken_ext')
+pyinstaller_args.append('--hidden-import=tiktoken_ext.openai_public')
 
 # Print the PyInstaller command for debugging
 print("PyInstaller command:", " ".join(pyinstaller_args))
