@@ -2878,6 +2878,9 @@ class ResearchAssistantApp(wx.Frame):
         self.conversation_dirty = False
         self.showing_loader = False
         
+        # Load document list from disk
+        self.load_document_info()
+        
         # Setup UI
         self.setup_ui()
         
@@ -2896,6 +2899,98 @@ class ResearchAssistantApp(wx.Frame):
         
         # Show the window
         self.Show()
+    
+    def save_document_info(self):
+        """Save document list and priorities to disk"""
+        try:
+            # Create Documents directory if it doesn't exist
+            documents_dir = os.path.join(self.base_path, "Documents")
+            os.makedirs(documents_dir, exist_ok=True)
+            
+            # Get list of filenames
+            filenames = list(self.documents.keys())
+            
+            # Create document info to save
+            document_info = {
+                "filenames": filenames,
+                "priorities": self.document_priorities
+            }
+            
+            # Save to JSON file
+            info_path = os.path.join(self.base_path, "document_info.json")
+            with open(info_path, 'w') as f:
+                json.dump(document_info, f, indent=2)
+            
+            log_message("Document info saved successfully")
+        except Exception as e:
+            log_message(f"Error saving document info: {str(e)}", True)
+    
+    def load_document_info(self):
+        """Load document list and priorities from disk"""
+        try:
+            # Check if document info file exists
+            info_path = os.path.join(self.base_path, "document_info.json")
+            if not os.path.exists(info_path):
+                log_message("Document info file not found, starting with empty list")
+                return
+            
+            # Load document info
+            with open(info_path, 'r') as f:
+                document_info = json.load(f)
+            
+            # Get list of filenames and priorities
+            filenames = document_info.get("filenames", [])
+            self.document_priorities = document_info.get("priorities", {})
+            
+            # Load each document from file
+            documents_dir = os.path.join(self.base_path, "Documents")
+            for filename in filenames:
+                file_path = os.path.join(documents_dir, filename)
+                
+                # Check if file exists
+                if not os.path.exists(file_path):
+                    log_message(f"Warning: Document '{filename}' not found in Documents directory", True)
+                    continue
+                
+                # Load document content based on file extension
+                file_extension = os.path.splitext(filename)[1].lower()
+                content = ""
+                
+                try:
+                    # Use appropriate method to read file based on extension
+                    if file_extension == '.pdf':
+                        try:
+                            import pypdf
+                            with open(file_path, 'rb') as f:
+                                pdf_reader = pypdf.PdfReader(f)
+                                for page in pdf_reader.pages:
+                                    content += page.extract_text() + "\n"
+                        except ImportError:
+                            content = f"[PDF content not extracted - required modules not available]\n\nFile: {filename}"
+                    elif file_extension == '.docx':
+                        try:
+                            import docx
+                            doc = docx.Document(file_path)
+                            for para in doc.paragraphs:
+                                content += para.text + "\n"
+                        except ImportError:
+                            content = f"[DOCX content not extracted - docx module not available]\n\nFile: {filename}"
+                    else:
+                        # Plain text or markdown
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            content = f.read()
+                    
+                    # Store document content
+                    self.documents[filename] = content
+                except Exception as e:
+                    log_message(f"Error loading document '{filename}': {str(e)}", True)
+            
+            log_message(f"Loaded {len(self.documents)} documents from disk")
+            
+            # Note: We can't refresh the document list here because the UI is not set up yet
+            # The documents will be displayed when the UI is initialized
+        except Exception as e:
+            log_message(f"Error loading document info: {str(e)}", True)
     
     def initialize_database(self):
         """Initialize the Neo4j database connection"""
@@ -3379,6 +3474,9 @@ class ResearchAssistantApp(wx.Frame):
     def on_close(self, event):
         """Handle window close event - stop Neo4j server"""
         try:
+            # Save document info before closing
+            self.save_document_info()
+            
             # Stop the Neo4j server if it's running
             if hasattr(self, 'neo4j_server'):
                 self.neo4j_server.stop()
@@ -3599,7 +3697,11 @@ class ResearchAssistantApp(wx.Frame):
             right_panel.SetSizer(right_sizer)
             main_sizer.Add(right_panel, 2, wx.EXPAND | wx.ALL, 10)
             
+            # Set the sizer for the panel
             panel.SetSizer(main_sizer)
+            
+            # Refresh the document list to display any documents loaded from disk
+            self.refresh_document_list()
             
             log_message("wxPython UI setup complete")
         except Exception as e:
@@ -3742,6 +3844,10 @@ class ResearchAssistantApp(wx.Frame):
                         "Upload Error",
                         wx.OK | wx.ICON_ERROR
                     )
+            
+            # Save document info to disk after all uploads
+            self.save_document_info()
+            
         except Exception as e:
             log_message(f"Error in document upload: {str(e)}", True)
             log_message(traceback.format_exc(), True)
@@ -3807,15 +3913,28 @@ class ResearchAssistantApp(wx.Frame):
                 # Create a document ID consistent with upload
                 import hashlib
                 doc_id = hashlib.md5(filename.encode()).hexdigest()
-                self.neo4j_manager.remove_document(doc_id)
+                
+                # Try to remove from database
+                if self.neo4j_manager.remove_document(doc_id):
+                    log_message(f"Document '{filename}' removed from database")
+                else:
+                    log_message(f"Document '{filename}' not found in database or could not be removed", True)
             
             # Refresh the document list
             self.refresh_document_list()
             
+            # Save document info to disk
+            self.save_document_info()
+            
             log_message(f"Document removed: {filename}")
         except Exception as e:
-            log_message(f"Error deleting document: {str(e)}", True)
+            log_message(f"Error removing document: {str(e)}", True)
             log_message(traceback.format_exc(), True)
+            wx.MessageBox(
+                f"Error removing document:\n{str(e)}",
+                "Deletion Error",
+                wx.OK | wx.ICON_ERROR
+            )
     
     def on_upload_to_database(self, event):
         """Upload selected documents to the database without deleting them first"""
@@ -4092,6 +4211,9 @@ class ResearchAssistantApp(wx.Frame):
                 # Get the updated priorities
                 self.document_priorities = dialog.get_priorities()
                 log_message("Document priorities updated")
+                
+                # Save document info to persist priorities
+                self.save_document_info()
             
             dialog.Destroy()
         except Exception as e:
