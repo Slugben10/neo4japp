@@ -766,10 +766,13 @@ class Neo4jDatabaseManager:
                 result = session.run("""
                     MATCH (d:Document)
                     WHERE d.title IS NOT NULL AND d.title <> 'None' AND d.document_id <> 'placeholder'
-                    RETURN d.document_id as id, d.title as title, COUNT((d)-[:CONTAINS]->()) as chunks
+                    RETURN d.document_id as id, d.title as title, COUNT((d)-[:CONTAINS]->()) as chunks, 
+                           d.priority as priority
                     ORDER BY d.title
                 """)
-                return [(record["id"], record["title"], record["chunks"]) for record in result]
+                return [(record["id"], record["title"], record["chunks"], 
+                         record["priority"] if record["priority"] is not None else "Medium") 
+                        for record in result]
         except Exception as e:
             log_message(f"Error getting document list: {str(e)}", True)
             return []
@@ -4950,9 +4953,10 @@ class ResearchAssistantApp(wx.Frame):
             
             # Format the document list
             doc_text = f"Documents in Database ({len(docs)} total):\n\n"
-            for doc_id, title, chunks in docs:
+            for doc_id, title, chunks, priority in docs:
                 doc_text += f"Title: {title}\n"
                 doc_text += f"ID: {doc_id}\n"
+                doc_text += f"Priority: {priority}\n"
                 doc_text += "-" * 80 + "\n"
 
             text_ctrl.SetValue(doc_text)
