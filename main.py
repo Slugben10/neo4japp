@@ -741,12 +741,14 @@ class Neo4jDatabaseManager:
             # STEP 2: Reinitialize vector store to clear it
             if LANGCHAIN_AVAILABLE and self.vector_store:
                 try:
-                    # Reinitialize the vector store with empty state
-                    self.vector_store = Neo4jVectorStore4x(
-                        driver=self.driver,
-                        embedding_function=self.vector_store.embedding_function
-                    )
-                    log_message("Vector store reinitialized and cleared")
+                    # Instead of directly using Neo4jVectorStore4x which is out of scope,
+                    # call initialize_vector_store to properly reinitialize it
+                    current_embedding_function = self.vector_store.embedding_function
+                    success = self.initialize_vector_store(current_embedding_function)
+                    if success:
+                        log_message("Vector store reinitialized and cleared")
+                    else:
+                        log_message("Failed to reinitialize vector store", True)
                 except Exception as e:
                     log_message(f"Error reinitializing vector store: {str(e)}", True)
                     # Continue even if vector store reinitialization fails
